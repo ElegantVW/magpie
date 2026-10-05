@@ -20,6 +20,7 @@ Status: v0.1 TUI prompt box + `seek` + local PDF (`seek.json` + `processed.json`
 magpie                         # TUI: prompt box, Enter seeks, returns PDF
 magpie seek "opel corsa C 2005 1.3 cdti" --depth extreme --pages 12
 magpie seek "query" --depth quick --pages 6 --out /tmp/out --no-pdf
+magpie process /tmp/out        # pixie pass: one quick local AI task per entry, then structured PDF
 magpie browse --dump https://example.com   # compat for pixie
 ```
 

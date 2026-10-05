@@ -2,6 +2,7 @@ mod cli;
 mod crawl;
 mod error;
 mod pdf;
+mod process;
 mod seek;
 mod store;
 mod termart;
@@ -32,6 +33,12 @@ async fn run(c: Cli) -> anyhow::Result<()> {
             }
             anyhow::bail!("fetch failed");
         }
+    }
+    if let Some(Cmd::Process { dir }) = c.cmd.clone() {
+        let dir = crate::process::run_process(std::path::PathBuf::from(dir), None).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        println!("processed -> {}/processed.json", dir.display());
+        println!("pdf -> {}/manual.pdf", dir.display());
+        return Ok(());
     }
     if let Some(Cmd::Seek { query, out, depth, pages, no_pdf }) = c.cmd {
         let dir = crate::seek::run_seek(query.clone(), depth, pages, out, no_pdf).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;

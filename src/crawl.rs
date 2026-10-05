@@ -27,14 +27,24 @@ fn clean_ws(s: &str) -> String {
 }
 
 fn strip_tags(html: &str) -> String {
-    // remove script/style first (dot-all via [\s\S])
+    // preserve structure: block elements -> newlines before stripping
     let re_script = Regex::new(r"(?is)<script.*?</script>").unwrap();
     let re_style = Regex::new(r"(?is)<style.*?</style>").unwrap();
-    let re_tags = Regex::new(r"(?s)<[^>]+>").unwrap();
+    let re_block = Regex::new(r"(?is)</?(p|div|br|tr|li|h1|h2|h3|h4|table)[^>]*>").unwrap();
     let t = re_script.replace_all(html, " ");
     let t = re_style.replace_all(&t, " ");
+    let t = re_block.replace_all(&t, "\n");
+    let re_tags = Regex::new(r"(?s)<[^>]+>").unwrap();
     let t = re_tags.replace_all(&t, " ");
-    clean_ws(&html_escape::decode_html_entities(&t))
+    // keep newlines, collapse spaces per line
+    let decoded = html_escape::decode_html_entities(&t);
+    let ws = Regex::new(r"[ \t]+").unwrap();
+    decoded
+        .split('\n')
+        .map(|l| ws.replace_all(l.trim(), " ").to_string())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub fn safe_truncate(s: &str, n_chars: usize) -> String {
@@ -69,11 +79,12 @@ async fn fetch_one(url: &str) -> Result<Page> {
         .await
         .map_err(|e| MagpieError::Network(e.to_string()))?;
     let (title, text) = extract_text(&html);
+    let chars = text.chars().count();
     Ok(Page {
         url: url.to_string(),
         title,
         text: text.clone(),
-        chars: text.len(),
+        chars,
     })
 }
 
@@ -257,6 +268,9 @@ pub async fn plan_urls(
     send(&format!("search: marginalia got {}", mar.len()));
 
     for u in ddg.into_iter().chain(mar) {
+        if spam_host(&host_of(&u)) {
+            continue;
+        }
         if seen.insert(u.clone()) {
             urls.push(u);
         }
@@ -300,6 +314,9 @@ pub async fn plan_urls(
                 }
             };
             for u in extra {
+                if spam_host(&host_of(&u)) {
+                    continue;
+                }
                 if seen.insert(u.clone()) {
                     urls.push(u);
                 }
@@ -346,6 +363,20 @@ pub async fn crawl_urls(urls: &[String], prog: Option<tokio::sync::mpsc::Unbound
         }
     }
     out
+}
+
+fn host_of(u: &str) -> String {
+    url::Url::parse(u).map(|p| p.host_str().unwrap_or("").to_string()).unwrap_or_default()
+}
+
+fn spam_host(h: &str) -> bool {
+    let h = h.to_lowercase();
+    h.contains("adtargeting.io")
+        || h.contains("gumtree.com")
+        || h.contains("alchetron.com")
+        || h.contains("creativecommons.org")
+        || h.contains("facebook.com")
+        || h.contains("instagram.com")
 }
 
 /// Second-hop thoroughness: harvest outbound links from fetched pages

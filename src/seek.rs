@@ -54,8 +54,18 @@ pub async fn run_seek_with_progress(
             pages.append(&mut more);
         }
     }
-    // sort longest first, thorough
-    pages.sort_by_key(|p| std::cmp::Reverse(p.chars));
+    // rank: spec density + length, drop spam hosts already filtered
+    // score = chars/1000 + 3*spec_hits (numbers+units), prefer tables
+    pages.sort_by_key(|p| {
+        let t = p.text.to_lowercase();
+        let mut hits = 0;
+        for u in ["ps", "hp", "kw", "nm", "mm", "kg", "l/100", "g/km", "0-100", "top speed", "torque", "power", "fault", "problem", "recall", "service", "oil", "timing"] {
+            if t.contains(u) {
+                hits += 1;
+            }
+        }
+        std::cmp::Reverse((p.chars / 1000) + hits * 3)
+    });
 
     let mut hosts_set = HashSet::new();
     for p in &pages {

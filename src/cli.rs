@@ -45,4 +45,9 @@ pub enum Cmd {
         #[arg(long, default_value_t = false)]
         dump: bool,
     },
+    /// Pixie pass: one quick local AI task per crawled entry, then structured PDF
+    Process {
+        /// Seek dir (contains seek.json)
+        dir: String,
+    },
 }

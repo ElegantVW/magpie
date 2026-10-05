@@ -22,8 +22,10 @@ pub async fn run_tui() -> anyhow::Result<()> {
     let mut tick: usize = 0;
     let mut seek_start: Option<std::time::Instant> = None;
     let mut last_msg_at: Option<std::time::Instant> = None;
+    let mut log_off: usize = 0; // scroll offset into log (0 = tail)
+    let mut auto_tail = true;
 
-    draw(&mut out, &input, &log, &last_pdf, seeking.as_ref(), tick, seek_start, last_msg_at)?;
+    draw(&mut out, &input, &log, &last_pdf, seeking.as_ref(), tick, seek_start, last_msg_at, log_off)?;
 
     loop {
         // 250ms tick: calmer than 120ms full-clear (flicker fix).
@@ -67,11 +69,24 @@ pub async fn run_tui() -> anyhow::Result<()> {
                     KeyCode::Char(c) => {
                         if seeking.is_none() {
                             input.push(c);
+                            auto_tail = true;
                         }
                     }
                     KeyCode::Backspace => {
                         if seeking.is_none() {
                             input.pop();
+                        }
+                    }
+                    KeyCode::Up | KeyCode::PageUp => {
+                        auto_tail = false;
+                        log_off += 1;
+                    }
+                    KeyCode::Down | KeyCode::PageDown => {
+                        if log_off > 0 {
+                            log_off -= 1;
+                        }
+                        if log_off == 0 {
+                            auto_tail = true;
                         }
                     }
                     _ => {}
@@ -109,9 +124,12 @@ pub async fn run_tui() -> anyhow::Result<()> {
             while log.len() > 200 {
                 log.remove(0);
             }
+            if auto_tail {
+                log_off = 0;
+            }
         }
 
-        draw(&mut out, &input, &log, &last_pdf, seeking.as_ref(), tick, seek_start, last_msg_at)?;
+        draw(&mut out, &input, &log, &last_pdf, seeking.as_ref(), tick, seek_start, last_msg_at, log_off)?;
     }
 
     disable_raw_mode()?;
@@ -136,14 +154,18 @@ fn draw(
     tick: usize,
     seek_start: Option<std::time::Instant>,
     last_msg_at: Option<std::time::Instant>,
+    log_off: usize,
 ) -> anyhow::Result<()> {
-    // House chrome: `╭─ ✦ Magpie ✦ ─` frames, calm MoveTo redraw.
+    // House chrome: `╭─ ✦ Magpie ✦ ─` frames, adaptive like scroll/pixie.
+    // Width from raw winsize each frame (no 96 cap for TUI); height budgets
+    // footer-first so small windows clip log, never chrome.
     use crossterm::cursor::MoveTo;
     use crossterm::terminal::ClearType;
     execute!(out, MoveTo(0, 0))?;
     execute!(out, crossterm::terminal::Clear(ClearType::FromCursorDown))?;
-    let (cols, _rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    let w = (cols as usize).clamp(60, 100);
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let w = ((cols as usize).saturating_sub(2)).clamp(24, 200);
+    let h = ((rows as usize).saturating_sub(1)).max(10);
     let spin = SPINNER[(tick / 2) % SPINNER.len()];
 
     let prompt_body = if seeking.is_some() {
@@ -172,12 +194,58 @@ fn draw(
         writeln!(out, "{}", crate::termart::box_frame(&body, "Seek", &format!("query: {}", safe_head(&job.query, 60)), w))?;
     }
 
-    let tail: Vec<String> = log.iter().rev().take(12).map(|l| format!("· {}", safe_head(l, 100))).collect();
-    let mut shown: Vec<String> = tail.into_iter().rev().collect();
-    if shown.is_empty() {
-        shown.push("· idle".into());
+    // Height budget footer-first (scroll pattern): prompt + seek + runes +
+    // signature get fixed chrome, log gets the rest with ↑/↓ window.
+    // box_frame heights: prompt 4 (top+2 body+bottom w/ subtitle rule),
+    // seek 4-5, runes 4, signature 1, gaps 3.
+    let prompt_h = 5usize;
+    let seek_h = if seeking.is_some() { 5usize } else { 0 };
+    let runes_h = 4usize;
+    let sig_h = 1usize;
+    let gaps = 3usize;
+    let chrome = prompt_h + seek_h + runes_h + sig_h + gaps;
+    let log_h = h.saturating_sub(chrome).max(5);
+    // inner rows inside log borders
+    let max_rows = log_h.saturating_sub(2).max(1);
+
+    let total = log.len();
+    let off = log_off.min(total.saturating_sub(1).max(0));
+    // window with ↑/↓ indicators inside budget
+    let mut rows: Vec<String> = vec![];
+    if total == 0 {
+        rows.push("· idle".into());
+    } else if total <= max_rows {
+        for l in log {
+            rows.push(format!("· {}", safe_head(l, 100)));
+        }
+    } else {
+        let need_up = off > 0;
+        let mut room = max_rows.saturating_sub(if need_up { 1 } else { 0 });
+        let remaining = total.saturating_sub(off);
+        let need_down = remaining > room;
+        if need_down {
+            room = room.saturating_sub(1).max(1);
+        }
+        let need_down = off + room < total;
+        // slice from tail backwards by off
+        let end = total.saturating_sub(off);
+        let start = end.saturating_sub(room);
+        if need_up {
+            rows.push(format!("· ↑ {} above · Up/PgUp ·", off));
+        }
+        for l in &log[start..end] {
+            rows.push(format!("· {}", safe_head(l, 100)));
+        }
+        if need_down {
+            rows.push(format!("· ↓ {} more · Down keeps tail ·", total - end));
+        }
     }
-    writeln!(out, "{}", crate::termart::box_frame(&shown, "Log", "", w))?;
+    // hard cap: never exceed frame height (drop from top of log window)
+    while rows.len() > max_rows {
+        rows.remove(0);
+    }
+    let subtitle = if off > 0 { format!("scroll · ↑{} · Down resumes tail", off) } else { String::new() };
+    writeln!(out, "{}", crate::termart::box_frame(&rows, "Log", &subtitle, w))?;
 
     let runes = if seeking.is_some() {
         "[working… Esc cancels seek, prompt held]"
