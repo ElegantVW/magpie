@@ -4,6 +4,7 @@ mod error;
 mod pdf;
 mod seek;
 mod store;
+mod termart;
 mod tui;
 
 use clap::Parser;

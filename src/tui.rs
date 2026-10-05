@@ -137,39 +137,55 @@ fn draw(
     seek_start: Option<std::time::Instant>,
     last_msg_at: Option<std::time::Instant>,
 ) -> anyhow::Result<()> {
-    // Calm redraw: cursor home + clear-down, no full Clear(All) flash.
-    // Spinner steps every 2nd tick so it reads as progress, not strobe.
+    // House chrome: `╭─ ✦ Magpie ✦ ─` frames, calm MoveTo redraw.
     use crossterm::cursor::MoveTo;
     use crossterm::terminal::ClearType;
     execute!(out, MoveTo(0, 0))?;
     execute!(out, crossterm::terminal::Clear(ClearType::FromCursorDown))?;
+    let (cols, _rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let w = (cols as usize).clamp(60, 100);
     let spin = SPINNER[(tick / 2) % SPINNER.len()];
-    if let Some(job) = seeking {
-        writeln!(out, "┌ seek > [{} seeking: {}] ───────────────────", spin, safe_head(&job.query, 40))?;
-        writeln!(out, "│ {input} (busy — Esc cancels seek)")?;
+
+    let prompt_body = if seeking.is_some() {
+        vec![format!("│ {input} (busy — Esc cancels seek)")]
     } else {
-        writeln!(out, "┌ seek > ─────────────────────────────────────────────")?;
-        writeln!(out, "│ {input}")?;
-    }
-    writeln!(out, "└─────────────────────────────────────────────────────")?;
+        vec![format!("│ {input}")]
+    };
+    let prompt = crate::termart::box_frame(
+        &prompt_body,
+        &format!("Magpie {} seeking", if seeking.is_some() { spin } else { "·" }),
+        "thorough seeker — type query, Enter seeks",
+        w,
+    );
+    writeln!(out, "{prompt}")?;
+
     if let Some(job) = seeking {
         let elapsed = seek_start.map(|t| t.elapsed().as_secs()).unwrap_or(0);
         let stale = last_msg_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
-        writeln!(out, "{} {} ({}s, update {}s ago)", spin, safe_head(&job.status, 90), elapsed, stale)?;
-        if stale > 15 {
-            writeln!(out, "still working… engines may be throttled (DDG/Marginalia). Esc cancels.")?;
-        }
+        let status = format!("{} {} ({}s, update {}s ago)", spin, safe_head(&job.status, 90), elapsed, stale);
+        let extra = if stale > 15 {
+            "engines may be throttled (DDG/Marginalia). Esc cancels."
+        } else {
+            ""
+        };
+        let body = if extra.is_empty() { vec![status] } else { vec![status, extra.into()] };
+        writeln!(out, "{}", crate::termart::box_frame(&body, "Seek", &format!("query: {}", safe_head(&job.query, 60)), w))?;
     }
-    writeln!(out, "log:")?;
-    for l in log.iter().rev().take(16) {
-        writeln!(out, "  {}", safe_head(l, 100))?;
+
+    let tail: Vec<String> = log.iter().rev().take(12).map(|l| format!("· {}", safe_head(l, 100))).collect();
+    let mut shown: Vec<String> = tail.into_iter().rev().collect();
+    if shown.is_empty() {
+        shown.push("· idle".into());
     }
-    writeln!(out, "pdf: {last_pdf}")?;
-    if seeking.is_some() {
-        writeln!(out, "[working… Esc cancels seek, prompt held]")?;
+    writeln!(out, "{}", crate::termart::box_frame(&shown, "Log", "", w))?;
+
+    let runes = if seeking.is_some() {
+        "[working… Esc cancels seek, prompt held]"
     } else {
-        writeln!(out, "[Enter] seek  [Esc] quit")?;
-    }
+        "[Enter] seek · [Esc] quit"
+    };
+    writeln!(out, "{}", crate::termart::box_frame(&[runes.into(), format!("pdf: {last_pdf}")], "Runes", "", w))?;
+    writeln!(out, "{}", crate::termart::signature(w))?;
     out.flush()?;
     Ok(())
 }
