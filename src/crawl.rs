@@ -268,7 +268,7 @@ pub async fn plan_urls(
     send(&format!("search: marginalia got {}", mar.len()));
 
     for u in ddg.into_iter().chain(mar) {
-        if spam_host(&host_of(&u)) {
+        if spam_url(&u) {
             continue;
         }
         if seen.insert(u.clone()) {
@@ -314,7 +314,7 @@ pub async fn plan_urls(
                 }
             };
             for u in extra {
-                if spam_host(&host_of(&u)) {
+                if spam_url(&u) {
                     continue;
                 }
                 if seen.insert(u.clone()) {
@@ -377,12 +377,72 @@ fn spam_host(h: &str) -> bool {
         || h.contains("creativecommons.org")
         || h.contains("facebook.com")
         || h.contains("instagram.com")
+        // dealer lots / lead-gen: specs never live here
+        || h.contains("cinch.co.uk")
+        || h.contains("unbeatablecar.com")
+        || h.contains("deniskinanehonda")
+        || h.contains("choosemycar.com")
+        || h.contains("autotrader")
+        || h.contains("ebay.")
+        || h.contains("pistonheads.com")
+        // classifieds / marketplaces in other locales
+        || h.contains("otomoto.pl")
+        || h.contains("mobile.de")
+        || h.contains("autoscout24")
+        || h.contains("olx.")
+}
+
+fn spam_url(u: &str) -> bool {
+    let lu = u.to_lowercase();
+    if spam_host(&host_of(u)) {
+        return true;
+    }
+    // for-sale / classified paths, even on legit hosts (parkers, rac)
+    lu.contains("/for-sale/")
+        || lu.contains("/srpsearch")
+        || lu.contains("/cars-vans-motorbikes/")
+        || lu.contains("/used-cars/")
+        || lu.contains("/vans-for-sale")
+        || lu.contains("usedvfs-")
+}
+
+/// Boost: hosts where specs / reliability / dimensions actually live.
+fn boost_host(h: &str) -> i32 {
+    let h = h.to_lowercase();
+    let mut b = 0;
+    for good in [
+        "cars-data.com",
+        "ultimatespecs.com",
+        "cardimension",
+        "engineexplained",
+        "fordengines",
+        "opel-infos",
+        "parkers.co.uk",
+        "rac.co.uk",
+        "autogidas",
+        "curbsideclassic",
+        "honestjohn",
+        "adac.de",
+    ] {
+        if h.contains(good) {
+            b += 4;
+        }
+    }
+    b
 }
 
 /// Second-hop thoroughness: harvest outbound links from fetched pages
 /// so we still get many various sources when DDG/Marginalia rate-limit.
-pub async fn expand_second_hop(pages: &[Page], max_extra: usize) -> Vec<String> {
+/// Only links matching a query token survive (kills off-topic drift);
+/// boosted hosts rank first.
+pub async fn expand_second_hop(query: &str, pages: &[Page], max_extra: usize) -> Vec<String> {
     use std::collections::HashSet;
+    let tokens: Vec<String> = query
+        .to_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| t.len() > 2)
+        .map(|t| t.to_string())
+        .collect();
     let mut seen: HashSet<String> = pages.iter().map(|p| p.url.clone()).collect();
     let mut scored: Vec<(i32, String)> = vec![];
     let re = Regex::new(r#"(?i)href\s*=\s*"(https?://[^"]+)""#).unwrap();
@@ -396,7 +456,7 @@ pub async fn expand_second_hop(pages: &[Page], max_extra: usize) -> Vec<String> 
             if u.ends_with(".jpg") || u.ends_with(".png") || u.ends_with(".svg") || u.ends_with(".css") || u.ends_with(".js") {
                 continue;
             }
-            if u.contains("creativecommons.org") {
+            if spam_url(&u) {
                 continue;
             }
             // skip low-value interlanguage wikipedia unless DE/PL/IT/EN
@@ -409,8 +469,11 @@ pub async fn expand_second_hop(pages: &[Page], max_extra: usize) -> Vec<String> 
                 continue;
             }
             let lu = u.to_lowercase();
-            let mut score = 0;
-            for kw in ["opel", "corsa", "cdti", "multijet", "jtd", "diesel", "fiat", "vauxhall", "auto", "motor", "car"] {
+            if !tokens.iter().any(|t| lu.contains(t.as_str())) {
+                continue;
+            }
+            let mut score = boost_host(&host_of(&u));
+            for kw in ["opel", "corsa", "cdti", "multijet", "jtd", "diesel", "fiat", "vauxhall", "auto", "motor", "car", "transit", "focus", "spec", "reliability", "dimension", "engine"] {
                 if lu.contains(kw) {
                     score += 2;
                 }

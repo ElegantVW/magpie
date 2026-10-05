@@ -24,7 +24,12 @@ magpie process /tmp/out        # pixie pass: one quick local AI task per entry, 
 magpie browse --dump https://example.com   # compat for pixie
 ```
 
-TUI keys: type + `Enter` seek, `Esc` quit. Output dir prints as `.../manual.pdf`.
+TUI keys: type + `Enter` seek, `p` pixie pass on last result, `e` entry list, `Enter` opens entry, `Esc` cancel/quit.
+
+## Thoroughness
+
+* Chain: DDG HTML POST → old-search Marginalia → Wikipedia API → query variants → second-hop outbound links (query-token gated, dealer-lot blocklist)
+* Gate: warns on `<4 pages`, `<3 hosts`, wiki-only. No PDF-only-from-wikipedia claim.
 
 ## Thoroughness
 

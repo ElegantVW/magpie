@@ -9,6 +9,41 @@ use std::time::Duration;
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+#[derive(Clone, Copy, PartialEq)]
+enum View {
+    Log,
+    Entries,
+}
+
+struct EntryRow {
+    kind: String,
+    title: String,
+    url: String,
+    bullets: Vec<String>,
+}
+
+fn load_entries(dir: &PathBuf) -> Vec<EntryRow> {
+    let raw = std::fs::read_to_string(dir.join("processed.json")).unwrap_or_default();
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
+    v.get("entries")
+        .and_then(|e| e.as_array())
+        .map(|a| {
+            a.iter()
+                .map(|e| EntryRow {
+                    kind: e.get("kind").and_then(|k| k.as_str()).unwrap_or("other").into(),
+                    title: e.get("title").and_then(|k| k.as_str()).unwrap_or("").into(),
+                    url: e.get("url").and_then(|k| k.as_str()).unwrap_or("").into(),
+                    bullets: e
+                        .get("bullets")
+                        .and_then(|b| b.as_array())
+                        .map(|b| b.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).take(3).collect())
+                        .unwrap_or_default(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// House TUI: fixed-height panels, footer-first budget, dirty-only redraw.
 pub async fn run_tui() -> anyhow::Result<()> {
     enable_raw_mode()?;
@@ -21,6 +56,7 @@ pub async fn run_tui() -> anyhow::Result<()> {
     let mut hist_i: Option<usize> = None;
     let mut log: Vec<String> = vec!["magpie tui — type query, Enter to seek, Esc to quit".into()];
     let mut last_pdf = String::from("no seek yet");
+    let mut last_dir: Option<PathBuf> = None;
     let mut seeking: Option<SeekJob> = None;
     let mut tick: usize = 0;
     let mut seek_start: Option<std::time::Instant> = None;
@@ -28,8 +64,12 @@ pub async fn run_tui() -> anyhow::Result<()> {
     let mut log_off: usize = 0;
     let mut auto_tail = true;
     let mut last_frame = String::new();
+    // entries preview (loaded after `process`)
+    let mut view = View::Log;
+    let mut entries: Vec<EntryRow> = vec![];
+    let mut sel: usize = 0;
 
-    draw(&mut out, &input, cursor, &log, &last_pdf, seeking.as_ref(), tick, seek_start, last_msg_at, log_off, &mut last_frame)?;
+    draw(&mut out, &input, cursor, &log, &last_pdf, seeking.as_ref(), tick, seek_start, last_msg_at, log_off, view, &entries, sel, last_dir.is_some(), &mut last_frame)?;
 
     loop {
         if event::poll(Duration::from_millis(250))? {
@@ -44,12 +84,26 @@ pub async fn run_tui() -> anyhow::Result<()> {
                             seeking = None;
                             seek_start = None;
                             last_msg_at = None;
+                        } else if view == View::Entries {
+                            view = View::Log;
                         } else {
                             break;
                         }
                     }
                     KeyCode::Enter => {
-                        if seeking.is_none() {
+                        if view == View::Entries {
+                            // open entry: drop bullets + url into log, back to Log
+                            if let Some(e) = entries.get(sel) {
+                                log.push(format!("[{}] {}", e.kind, e.title));
+                                for b in &e.bullets {
+                                    log.push(format!("  • {b}"));
+                                }
+                                log.push(format!("  {}", e.url));
+                            }
+                            view = View::Log;
+                            auto_tail = true;
+                            log_off = 0;
+                        } else if seeking.is_none() {
                             let q = input.trim().to_string();
                             if !q.is_empty() {
                                 if hist.last().map(|s| s.as_str()) != Some(q.as_str()) {
@@ -65,7 +119,7 @@ pub async fn run_tui() -> anyhow::Result<()> {
                                     .await
                                     .map_err(|e| e.to_string())
                                 });
-                                seeking = Some(SeekJob { query: q, rx, handle: Some(handle), status: "starting…".into() });
+                                seeking = Some(SeekJob { query: q, rx, handle: Some(handle), status: "starting…".into(), proc: false });
                                 seek_start = Some(std::time::Instant::now());
                                 last_msg_at = Some(std::time::Instant::now());
                                 log.push("seek started… (Esc cancels seek)".into());
@@ -77,22 +131,49 @@ pub async fn run_tui() -> anyhow::Result<()> {
                         }
                     }
                     KeyCode::Char(c) => {
-                        if seeking.is_none() {
-                            if k.modifiers.contains(KeyModifiers::CONTROL) && (c == 'u' || c == 'U') {
+                        if k.modifiers.contains(KeyModifiers::CONTROL) && (c == 'u' || c == 'U') {
+                            if seeking.is_none() {
                                 input.clear();
                                 cursor = 0;
                                 hist_i = None;
-                            } else {
-                                let idx = cursor.min(input.chars().count());
-                                let byte: usize = input.chars().take(idx).map(|ch| ch.len_utf8()).sum();
-                                input.insert(byte, c);
-                                cursor += 1;
                             }
+                        } else if c == 'p' && seeking.is_none() && view == View::Log && input.is_empty() && last_dir.is_some() {
+                            // pixie pass on last seek dir
+                            let dir = last_dir.clone().unwrap();
+                            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                            let handle = tokio::spawn(async move {
+                                crate::process::run_process(dir, Some(tx)).await.map_err(|e| e.to_string())
+                            });
+                            seeking = Some(SeekJob { query: "process".into(), rx, handle: Some(handle), status: "pixie pass…".into(), proc: true });
+                            seek_start = Some(std::time::Instant::now());
+                            last_msg_at = Some(std::time::Instant::now());
+                            log.push("process started… (Esc cancels)".into());
                             auto_tail = true;
+                            log_off = 0;
+                        } else if c == 'e' && seeking.is_none() && !entries.is_empty() && (view == View::Entries || input.is_empty()) {
+                            view = if view == View::Entries { View::Log } else { View::Entries };
+                            if view == View::Log {
+                                auto_tail = true;
+                                log_off = 0;
+                            }
+                        } else if seeking.is_none() && view == View::Log {
+                            let idx = cursor.min(input.chars().count());
+                            let byte: usize = input.chars().take(idx).map(|ch| ch.len_utf8()).sum();
+                            input.insert(byte, c);
+                            cursor += 1;
+                            auto_tail = true;
+                        } else if view == View::Entries && (c == 'j' || c == 'k') {
+                            if !entries.is_empty() {
+                                if c == 'j' {
+                                    sel = (sel + 1).min(entries.len() - 1);
+                                } else {
+                                    sel = sel.saturating_sub(1);
+                                }
+                            }
                         }
                     }
                     KeyCode::Backspace => {
-                        if seeking.is_none() && cursor > 0 {
+                        if seeking.is_none() && view == View::Log && cursor > 0 {
                             let idx = cursor - 1;
                             let byte: usize = input.chars().take(idx).map(|ch| ch.len_utf8()).sum();
                             input.remove(byte);
@@ -100,18 +181,19 @@ pub async fn run_tui() -> anyhow::Result<()> {
                         }
                     }
                     KeyCode::Left => {
-                        if seeking.is_none() && cursor > 0 {
+                        if seeking.is_none() && view == View::Log && cursor > 0 {
                             cursor -= 1;
                         }
                     }
                     KeyCode::Right => {
-                        if seeking.is_none() {
+                        if seeking.is_none() && view == View::Log {
                             cursor = (cursor + 1).min(input.chars().count());
                         }
                     }
                     KeyCode::Up => {
-                        if seeking.is_none() && !hist.is_empty() {
-                            // history when prompt has content or empty: Up recalls
+                        if view == View::Entries {
+                            sel = sel.saturating_sub(1);
+                        } else if seeking.is_none() && !hist.is_empty() {
                             let ni = match hist_i {
                                 None => hist.len() - 1,
                                 Some(i) => i.saturating_sub(1),
@@ -125,7 +207,11 @@ pub async fn run_tui() -> anyhow::Result<()> {
                         }
                     }
                     KeyCode::Down => {
-                        if seeking.is_none() && hist_i.is_some() {
+                        if view == View::Entries {
+                            if !entries.is_empty() {
+                                sel = (sel + 1).min(entries.len() - 1);
+                            }
+                        } else if seeking.is_none() && hist_i.is_some() {
                             let i = hist_i.unwrap();
                             if i + 1 >= hist.len() {
                                 hist_i = None;
@@ -144,13 +230,23 @@ pub async fn run_tui() -> anyhow::Result<()> {
                         }
                     }
                     KeyCode::PageUp => {
-                        auto_tail = false;
-                        log_off += 5;
+                        if view == View::Entries {
+                            sel = sel.saturating_sub(5);
+                        } else {
+                            auto_tail = false;
+                            log_off += 5;
+                        }
                     }
                     KeyCode::PageDown => {
-                        log_off = log_off.saturating_sub(5);
-                        if log_off == 0 {
-                            auto_tail = true;
+                        if view == View::Entries {
+                            if !entries.is_empty() {
+                                sel = (sel + 5).min(entries.len() - 1);
+                            }
+                        } else {
+                            log_off = log_off.saturating_sub(5);
+                            if log_off == 0 {
+                                auto_tail = true;
+                            }
                         }
                     }
                     _ => {}
@@ -170,11 +266,19 @@ pub async fn run_tui() -> anyhow::Result<()> {
             }
             let finished = job.handle.as_ref().map(|h| h.is_finished()).unwrap_or(false);
             if finished {
+                let was_proc = job.proc;
                 if let Some(h) = job.handle.take() {
                     match h.await {
                         Ok(Ok(dir)) => {
                             last_pdf = format!("{}/manual.pdf", dir.display());
-                            log.push(format!("done -> {last_pdf}"));
+                            last_dir = Some(dir.clone());
+                            if was_proc {
+                                entries = load_entries(&dir);
+                                sel = 0;
+                                log.push(format!("processed {} entries — [e] entries, [Enter] open", entries.len()));
+                            } else {
+                                log.push(format!("done -> {last_pdf} — [p] process"));
+                            }
                         }
                         Ok(Err(e)) => log.push(format!("error: {e}")),
                         Err(e) => log.push(format!("join error: {e}")),
@@ -192,7 +296,7 @@ pub async fn run_tui() -> anyhow::Result<()> {
             }
         }
 
-        draw(&mut out, &input, cursor, &log, &last_pdf, seeking.as_ref(), tick, seek_start, last_msg_at, log_off, &mut last_frame)?;
+        draw(&mut out, &input, cursor, &log, &last_pdf, seeking.as_ref(), tick, seek_start, last_msg_at, log_off, view, &entries, sel, last_dir.is_some(), &mut last_frame)?;
     }
 
     disable_raw_mode()?;
@@ -206,6 +310,7 @@ struct SeekJob {
     rx: tokio::sync::mpsc::UnboundedReceiver<String>,
     handle: Option<tokio::task::JoinHandle<std::result::Result<PathBuf, String>>>,
     status: String,
+    proc: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -220,6 +325,10 @@ fn draw(
     seek_start: Option<std::time::Instant>,
     last_msg_at: Option<std::time::Instant>,
     log_off: usize,
+    view: View,
+    entries: &[EntryRow],
+    sel: usize,
+    can_process: bool,
     last_frame: &mut String,
 ) -> anyhow::Result<()> {
     use crossterm::cursor::MoveTo;
@@ -230,8 +339,6 @@ fn draw(
     let spin = SPINNER[(tick / 2) % SPINNER.len()];
     let busy = seeking.is_some();
 
-    // Fixed heights footer-first: runes 4 + sig 1 + gaps 2, seek 0|5, prompt 4.
-    // Log gets the rest; tiny windows shrink log, never chrome.
     let runes_h = 4usize;
     let sig_h = 1usize;
     let gaps = 2usize;
@@ -241,18 +348,16 @@ fn draw(
     let log_h = h.saturating_sub(chrome).max(5);
     let max_rows = log_h.saturating_sub(2).max(1);
 
-    // Prompt body: NO literal borders (box_frame draws them). Caret as ▌.
     let before: String = input.chars().take(cursor).collect();
     let at: String = input.chars().skip(cursor).take(1).collect();
     let after: String = input.chars().skip(cursor + 1).collect();
     let caret_line = if busy {
-        format!("{before}{after}  (busy — Esc cancels seek)")
+        format!("{before}{after}  (busy — Esc cancels)")
     } else if at.is_empty() {
         format!("{before}▌")
     } else {
         format!("{before}▌{after}")
     };
-    // focus brightens prompt when idle
     let prompt = crate::termart::panel(
         &[caret_line],
         &format!("Magpie {} seeking", if busy { spin } else { "·" }),
@@ -272,53 +377,84 @@ fn draw(
         if stale > 15 {
             body.push("engines may be throttled (DDG/Marginalia). Esc cancels.".into());
         }
-        frame.push_str(&crate::termart::panel(&body, "Seek", w, Some(seek_h), false));
+        let title = if job.proc { "Process" } else { "Seek" };
+        frame.push_str(&crate::termart::panel(&body, title, w, Some(seek_h), false));
         frame.push('\n');
     }
 
-    // Log window with ↑/↓ inside budget
-    let total = log.len();
-    let off = log_off.min(total.saturating_sub(1).max(0));
-    let mut rows_v: Vec<String> = vec![];
-    if total == 0 {
-        rows_v.push("· idle".into());
-    } else if total <= max_rows {
-        for l in log {
-            rows_v.push(format!("· {}", safe_head(l, 100)));
+    if view == View::Entries && !entries.is_empty() {
+        let mut rows_v: Vec<String> = vec![];
+        let start = sel.saturating_sub(max_rows - 1).min(sel);
+        let end = (start + max_rows).min(entries.len());
+        let off = if sel >= max_rows { sel - max_rows + 1 } else { 0 };
+        let _ = off;
+        for (i, e) in entries.iter().enumerate().skip(start).take(end - start) {
+            let mark = if i == sel { "►" } else { "·" };
+            rows_v.push(format!("{mark} [{}] {}", e.kind, safe_head(&e.title, 80)));
         }
+        while rows_v.len() > max_rows {
+            rows_v.remove(0);
+        }
+        frame.push_str(&crate::termart::panel(
+            &rows_v,
+            &format!("Entries {}/{} — Enter opens", sel + 1, entries.len()),
+            w,
+            Some(log_h),
+            true,
+        ));
+        frame.push('\n');
     } else {
-        let need_up = off > 0;
-        let mut room = max_rows.saturating_sub(if need_up { 1 } else { 0 });
-        let remaining = total.saturating_sub(off);
-        if remaining > room {
-            room = room.saturating_sub(1).max(1);
+        let total = log.len();
+        let off = log_off.min(total.saturating_sub(1).max(0));
+        let mut rows_v: Vec<String> = vec![];
+        if total == 0 {
+            rows_v.push("· idle".into());
+        } else if total <= max_rows {
+            for l in log {
+                rows_v.push(format!("· {}", safe_head(l, 100)));
+            }
+        } else {
+            let need_up = off > 0;
+            let mut room = max_rows.saturating_sub(if need_up { 1 } else { 0 });
+            let remaining = total.saturating_sub(off);
+            if remaining > room {
+                room = room.saturating_sub(1).max(1);
+            }
+            let end = total.saturating_sub(off);
+            let start = end.saturating_sub(room);
+            if need_up {
+                rows_v.push(format!("· ↑ {} above · Up/PgUp ·", off));
+            }
+            for l in &log[start..end] {
+                rows_v.push(format!("· {}", safe_head(l, 100)));
+            }
+            if end < total {
+                rows_v.push(format!("· ↓ {} more · Down resumes tail ·", total - end));
+            }
         }
-        let end = total.saturating_sub(off);
-        let start = end.saturating_sub(room);
-        if need_up {
-            rows_v.push(format!("· ↑ {} above · Up/PgUp ·", off));
+        while rows_v.len() > max_rows {
+            rows_v.remove(0);
         }
-        for l in &log[start..end] {
-            rows_v.push(format!("· {}", safe_head(l, 100)));
-        }
-        if end < total {
-            rows_v.push(format!("· ↓ {} more · Down resumes tail ·", total - end));
-        }
+        let log_title = if off > 0 { format!("Log · ↑{off}") } else { "Log".to_string() };
+        frame.push_str(&crate::termart::panel(&rows_v, &log_title, w, Some(log_h), false));
+        frame.push('\n');
     }
-    while rows_v.len() > max_rows {
-        rows_v.remove(0);
-    }
-    let subtitle = if off > 0 { format!("scroll · ↑{} · Down resumes tail", off) } else { String::new() };
-    frame.push_str(&crate::termart::panel(&rows_v, "Log", w, Some(log_h), false));
-    frame.push('\n');
 
-    let chips = if busy { "[working…]  [Esc] cancel" } else { "[Enter] seek · [Esc] quit · [↑↓] history · [PgUp/PgDn] scroll · [←→] caret · [Ctrl-U] clear" };
-    frame.push_str(&crate::termart::panel(&[chips.into(), format!("pdf: {last_pdf}")], "Runes", w, Some(runes_h), false));
+    let mut chips = if busy {
+        "[working…]  [Esc] cancel".to_string()
+    } else {
+        "[Enter] seek · [Esc] quit · [↑↓] history · [PgUp/PgDn] scroll · [←→] caret · [Ctrl-U] clear".to_string()
+    };
+    if !busy && can_process {
+        chips.push_str(" · [p] process");
+    }
+    if !entries.is_empty() {
+        chips.push_str(" · [e] entries");
+    }
+    frame.push_str(&crate::termart::panel(&[chips, format!("pdf: {last_pdf}")], "Runes", w, Some(runes_h), false));
     frame.push('\n');
     frame.push_str(&crate::termart::signature(w));
 
-    // Dirty-only: skip write when identical (kills idle flicker).
-    // Spinner still steps 2x/sec while seeking, so progress stays live.
     if frame == *last_frame {
         return Ok(());
     }

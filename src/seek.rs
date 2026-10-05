@@ -45,7 +45,7 @@ pub async fn run_seek_with_progress(
         if let Some(tx) = &prog {
             let _ = tx.send("expanding outbound links…".into());
         }
-        let extra = expand_second_hop(&pages, pages_n.saturating_sub(pages.len())).await;
+        let extra = expand_second_hop(&query, &pages, pages_n.saturating_sub(pages.len())).await;
         if !extra.is_empty() {
             if let Some(tx) = &prog {
                 let _ = tx.send(format!("crawling {} extra urls…", extra.len()));

@@ -92,7 +92,31 @@ fn heuristic(title: &str, text: &str) -> (String, Vec<String>, Vec<[String; 2]>)
     for line in text.split('\n').filter(|l| l.trim().len() > 40).take(3) {
         bullets.push(line.trim().chars().take(160).collect());
     }
-    (kind.into(), bullets, vec![])
+    // harvest spec-looking rows so manuals carry tables even offline
+    let mut specs = vec![];
+    for line in text.split('\n') {
+        let l = line.trim();
+        if l.len() < 12 || l.len() > 140 {
+            continue;
+        }
+        let ll = l.to_lowercase();
+        let has_num = l.chars().any(|c| c.is_ascii_digit());
+        let has_unit = ["ps", "hp", "kw", "nm", "mm", "kg", "l/100", "g/km", "litre", "litres", "seconds", "mph", "km/h"]
+            .iter()
+            .any(|u| ll.contains(u));
+        if has_num && has_unit {
+            let kv: Vec<&str> = l.splitn(2, ':').collect();
+            if kv.len() == 2 {
+                specs.push([kv[0].trim().chars().take(28).collect(), kv[1].trim().chars().take(60).collect()]);
+            } else {
+                specs.push(["spec".to_string(), l.chars().take(88).collect()]);
+            }
+            if specs.len() >= 6 {
+                break;
+            }
+        }
+    }
+    (kind.into(), bullets, specs)
 }
 
 pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc::UnboundedSender<String>>) -> Result<std::path::PathBuf> {
@@ -120,27 +144,26 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
     });
     std::fs::write(dir.join("processed.json"), serde_json::to_string_pretty(&out).unwrap()).map_err(|e| MagpieError::Io(e.to_string()))?;
     if let Some(tx) = &prog {
-        let _ = tx.send("rendering PDF…".into());
+        let _ = tx.send("rendering manual…".into());
     }
-    // render structured manual from processed entries
-    let pages: Vec<crate::crawl::Page> = out["entries"]
-        .as_array()
-        .unwrap()
+    // structured manual from processed entries (grouped sections + TOC + sources)
+    let mentries: Vec<crate::pdf::ManualEntry> = entries
         .iter()
-        .map(|e| crate::crawl::Page {
-            url: e["url"].as_str().unwrap_or("").into(),
-            title: format!("[{}] {}", e["kind"].as_str().unwrap_or("other"), e["title"].as_str().unwrap_or("")),
-            text: e["bullets"].as_array().map(|b| b.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join("\n")).unwrap_or_default(),
-            chars: 0,
+        .map(|e| crate::pdf::ManualEntry {
+            kind: e.kind.clone(),
+            title: e.title.clone(),
+            url: e.url.clone(),
+            bullets: e.bullets.clone(),
+            specs: e.specs.clone(),
         })
         .collect();
     let hosts: Vec<String> = {
-        let mut h: Vec<String> = pages.iter().filter_map(|p| url::Url::parse(&p.url).ok()).map(|u| u.host_str().unwrap_or("").to_string()).collect();
+        let mut h: Vec<String> = entries.iter().filter_map(|p| url::Url::parse(&p.url).ok()).map(|u| u.host_str().unwrap_or("").to_string()).collect();
         h.sort();
         h.dedup();
         h
     };
-    crate::pdf::render_pdf(&query, &pages, &hosts, &dir.join("manual.pdf"))?;
+    crate::pdf::render_manual(&query, &mentries, &hosts, &dir.join("manual.pdf"))?;
     if let Some(tx) = &prog {
         let _ = tx.send("done".into());
     }
