@@ -32,7 +32,7 @@ pub async fn run_seek_with_progress(
     if let Some(tx) = &prog {
         let _ = tx.send("planning queries…".into());
     }
-    let plan = plan_urls(&query, &depth, pages_n).await;
+    let plan = plan_urls(&query, &depth, pages_n, prog.clone()).await;
     if plan.urls.is_empty() {
         return Err(MagpieError::NoResults("no urls planned".into()));
     }
@@ -116,6 +116,16 @@ pub async fn run_seek_with_progress(
         let pdf_path = dir.join("manual.pdf");
         render_pdf(&doc.query, &doc.pages, &doc.hosts, &pdf_path)?;
     }
+
+    // evidence log for hung/stall diagnosis
+    let _ = std::fs::write(
+        dir.join("seek.log"),
+        format!(
+            "query={}\ndepth={}\ncreated={}\npages={} hosts={:?}\nwarnings={:?}\n",
+            doc.query, doc.depth, doc.created,
+            doc.pages.len(), doc.hosts, doc.warnings
+        ),
+    );
 
     if let Some(tx) = &prog {
         let _ = tx.send("done".into());

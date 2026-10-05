@@ -218,7 +218,17 @@ pub struct CrawlPlan {
 }
 
 /// Build thorough URL list: DDG + Marginalia + Wikipedia titles.
-pub async fn plan_urls(query: &str, depth: &str, max_pages: usize) -> CrawlPlan {
+pub async fn plan_urls(
+    query: &str,
+    depth: &str,
+    max_pages: usize,
+    prog: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+) -> CrawlPlan {
+    let send = |m: &str| {
+        if let Some(tx) = &prog {
+            let _ = tx.send(m.to_string());
+        }
+    };
     let (per_engine, wiki_n) = match depth {
         "quick" => (4, 2),
         "extreme" => (10, 5),
@@ -227,8 +237,24 @@ pub async fn plan_urls(query: &str, depth: &str, max_pages: usize) -> CrawlPlan 
     let mut urls: Vec<String> = vec![];
     let mut seen = HashSet::new();
 
-    let ddg = ddg_search(query, per_engine).await;
-    let mar = marginalia_search(query, per_engine).await;
+    send("search: duckduckgo…");
+    let ddg = match tokio::time::timeout(std::time::Duration::from_secs(20), ddg_search(query, per_engine)).await {
+        Ok(v) => v,
+        Err(_) => {
+            send("search: duckduckgo timed out (20s), continuing…");
+            vec![]
+        }
+    };
+    send(&format!("search: duckduckgo got {}", ddg.len()));
+    send("search: marginalia…");
+    let mar = match tokio::time::timeout(std::time::Duration::from_secs(20), marginalia_search(query, per_engine)).await {
+        Ok(v) => v,
+        Err(_) => {
+            send("search: marginalia timed out (20s), continuing…");
+            vec![]
+        }
+    };
+    send(&format!("search: marginalia got {}", mar.len()));
 
     for u in ddg.into_iter().chain(mar) {
         if seen.insert(u.clone()) {
@@ -239,27 +265,41 @@ pub async fn plan_urls(query: &str, depth: &str, max_pages: usize) -> CrawlPlan 
         }
     }
     if urls.len() < max_pages {
-        let api = wikipedia_api(query);
-        if let Ok(p) = fetch_one(&api).await {
-            for cap in Regex::new(r#""title":"([^"]+)""#)
-                .unwrap()
-                .captures_iter(&p.text)
-                .take(wiki_n)
-            {
-                let t = cap[1].replace(' ', "_");
-                let u = format!("https://en.wikipedia.org/wiki/{t}");
-                if seen.insert(u.clone()) {
-                    urls.push(u);
+        send("search: wikipedia…");
+        match tokio::time::timeout(std::time::Duration::from_secs(15), fetch_one(&wikipedia_api(query))).await {
+            Ok(Ok(p)) => {
+                let mut n = 0;
+                for cap in Regex::new(r#""title":"([^"]+)""#)
+                    .unwrap()
+                    .captures_iter(&p.text)
+                    .take(wiki_n)
+                {
+                    let t = cap[1].replace(' ', "_");
+                    let u = format!("https://en.wikipedia.org/wiki/{t}");
+                    if seen.insert(u.clone()) {
+                        urls.push(u);
+                        n += 1;
+                    }
+                    if urls.len() >= max_pages {
+                        break;
+                    }
                 }
-                if urls.len() >= max_pages {
-                    break;
-                }
+                send(&format!("search: wikipedia got {n}"));
             }
+            _ => send("search: wikipedia timed out/failed, continuing…"),
         }
     }
     if depth != "quick" && urls.len() < max_pages {
         for variant in [format!("{query} specifications"), format!("{query} problems")] {
-            for u in ddg_search(&variant, 3).await {
+            send(&format!("search: variant {variant}…"));
+            let extra = match tokio::time::timeout(std::time::Duration::from_secs(20), ddg_search(&variant, 3)).await {
+                Ok(v) => v,
+                Err(_) => {
+                    send("search: variant timed out, continuing…");
+                    vec![]
+                }
+            };
+            for u in extra {
                 if seen.insert(u.clone()) {
                     urls.push(u);
                 }
