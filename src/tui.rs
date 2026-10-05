@@ -14,6 +14,7 @@ pub async fn run_tui() -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut out = io::stdout();
     execute!(out, EnterAlternateScreen)?;
+    execute!(out, crossterm::cursor::Hide)?;
     let mut input = String::new();
     let mut log: Vec<String> = vec!["magpie tui — type query, Enter to seek, Esc to quit".into()];
     let mut last_pdf = String::from("no seek yet");
@@ -25,8 +26,9 @@ pub async fn run_tui() -> anyhow::Result<()> {
     draw(&mut out, &input, &log, &last_pdf, seeking.as_ref(), tick, seek_start, last_msg_at)?;
 
     loop {
-        // poll with timeout so spinner animates even without keys
-        if event::poll(Duration::from_millis(120))? {
+        // 250ms tick: calmer than 120ms full-clear (flicker fix).
+        // Spinner advances every other tick so glyph doesn't race.
+        if event::poll(Duration::from_millis(250))? {
             if let Event::Key(k) = event::read()? {
                 match k.code {
                     KeyCode::Esc => {
@@ -113,6 +115,7 @@ pub async fn run_tui() -> anyhow::Result<()> {
     }
 
     disable_raw_mode()?;
+    execute!(out, crossterm::cursor::Show)?;
     execute!(out, LeaveAlternateScreen)?;
     Ok(())
 }
@@ -134,8 +137,13 @@ fn draw(
     seek_start: Option<std::time::Instant>,
     last_msg_at: Option<std::time::Instant>,
 ) -> anyhow::Result<()> {
-    execute!(out, crossterm::terminal::Clear(crossterm::terminal::ClearType::All))?;
-    let spin = SPINNER[tick % SPINNER.len()];
+    // Calm redraw: cursor home + clear-down, no full Clear(All) flash.
+    // Spinner steps every 2nd tick so it reads as progress, not strobe.
+    use crossterm::cursor::MoveTo;
+    use crossterm::terminal::ClearType;
+    execute!(out, MoveTo(0, 0))?;
+    execute!(out, crossterm::terminal::Clear(ClearType::FromCursorDown))?;
+    let spin = SPINNER[(tick / 2) % SPINNER.len()];
     if let Some(job) = seeking {
         writeln!(out, "┌ seek > [{} seeking: {}] ───────────────────", spin, safe_head(&job.query, 40))?;
         writeln!(out, "│ {input} (busy — Esc cancels seek)")?;
