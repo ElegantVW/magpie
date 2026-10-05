@@ -37,17 +37,21 @@ fn strip_tags(html: &str) -> String {
     clean_ws(&html_escape::decode_html_entities(&t))
 }
 
+pub fn safe_truncate(s: &str, n_chars: usize) -> String {
+    if s.chars().count() <= n_chars {
+        return s.to_string();
+    }
+    s.chars().take(n_chars).collect()
+}
+
 pub fn extract_text(html: &str) -> (String, String) {
     let re_title = Regex::new(r"(?is)<title[^>]*>(.*?)</title>").unwrap();
     let title = re_title
         .captures(html)
         .map(|c| clean_ws(&html_escape::decode_html_entities(&c[1])))
         .unwrap_or_default();
-    let mut t = strip_tags(html);
-    if t.len() > 12000 {
-        t.truncate(12000);
-    }
-    (title, t)
+    let t = strip_tags(html);
+    (safe_truncate(&title, 300), safe_truncate(&t, 12000))
 }
 
 async fn fetch_one(url: &str) -> Result<Page> {
@@ -118,26 +122,26 @@ async fn ddg_search(query: &str, n: usize) -> Vec<String> {
 }
 
 fn percent_decode(s: &str) -> String {
-    // minimal %XX decode + '+' -> space
-    let mut out = String::new();
+    // percent-decode to bytes first, then UTF-8 lossy (char-boundary safe)
     let bytes = s.as_bytes();
+    let mut buf: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
             if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
-                out.push((h * 16 + l) as char);
+                buf.push(h * 16 + l);
                 i += 3;
                 continue;
             }
         }
         if bytes[i] == b'+' {
-            out.push(' ');
+            buf.push(b' ');
         } else {
-            out.push(bytes[i] as char);
+            buf.push(bytes[i]);
         }
         i += 1;
     }
-    out
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 fn hex(b: u8) -> Option<u8> {
@@ -269,18 +273,36 @@ pub async fn plan_urls(query: &str, depth: &str, max_pages: usize) -> CrawlPlan 
     CrawlPlan { urls }
 }
 
-pub async fn crawl_urls(urls: &[String]) -> Vec<Page> {
+pub async fn crawl_urls(urls: &[String], prog: Option<tokio::sync::mpsc::UnboundedSender<String>>) -> Vec<Page> {
     let mut out = vec![];
-    for u in urls {
+    let total = urls.len();
+    for (i, u) in urls.iter().enumerate() {
+        if let Some(tx) = &prog {
+            let host = url::Url::parse(u)
+                .map(|p| p.host_str().unwrap_or("").to_string())
+                .unwrap_or_else(|_| u.chars().take(40).collect());
+            let _ = tx.send(format!("fetch {}/{} {}", i + 1, total, host));
+        }
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         match fetch_one(u).await {
             Ok(p) => {
-                if p.text.len() < 500 {
+                if p.text.chars().count() < 200 {
+                    if let Some(tx) = &prog {
+                        let _ = tx.send(format!("skip {}/{} (thin)", i + 1, total));
+                    }
                     continue;
+                }
+                if let Some(tx) = &prog {
+                    let _ = tx.send(format!("got {}/{} {}c", i + 1, total, p.chars));
                 }
                 out.push(p);
             }
-            Err(_) => continue,
+            Err(_) => {
+                if let Some(tx) = &prog {
+                    let _ = tx.send(format!("fail {}/{}", i + 1, total));
+                }
+                continue;
+            }
         }
     }
     out

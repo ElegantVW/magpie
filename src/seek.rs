@@ -15,19 +15,42 @@ pub struct SeekDoc {
 }
 
 pub async fn run_seek(query: String, depth: String, pages_n: usize, out: Option<String>, no_pdf: bool) -> Result<std::path::PathBuf> {
+    run_seek_with_progress(query, depth, pages_n, out, no_pdf, None).await
+}
+
+pub async fn run_seek_with_progress(
+    query: String,
+    depth: String,
+    pages_n: usize,
+    out: Option<String>,
+    no_pdf: bool,
+    prog: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+) -> Result<std::path::PathBuf> {
     let dir = seek_dir(&query, out);
     std::fs::create_dir_all(&dir).map_err(|e| MagpieError::Io(e.to_string()))?;
 
+    if let Some(tx) = &prog {
+        let _ = tx.send("planning queries…".into());
+    }
     let plan = plan_urls(&query, &depth, pages_n).await;
     if plan.urls.is_empty() {
         return Err(MagpieError::NoResults("no urls planned".into()));
     }
-    let mut pages = crawl_urls(&plan.urls).await;
+    if let Some(tx) = &prog {
+        let _ = tx.send(format!("crawling {} urls…", plan.urls.len()));
+    }
+    let mut pages = crawl_urls(&plan.urls, prog.clone()).await;
     // second-hop: harvest outbound links for diversity when engines throttle
     if pages.len() < pages_n {
+        if let Some(tx) = &prog {
+            let _ = tx.send("expanding outbound links…".into());
+        }
         let extra = expand_second_hop(&pages, pages_n.saturating_sub(pages.len())).await;
         if !extra.is_empty() {
-            let mut more = crawl_urls(&extra).await;
+            if let Some(tx) = &prog {
+                let _ = tx.send(format!("crawling {} extra urls…", extra.len()));
+            }
+            let mut more = crawl_urls(&extra, prog.clone()).await;
             pages.append(&mut more);
         }
     }
@@ -87,9 +110,15 @@ pub async fn run_seek(query: String, depth: String, pages_n: usize, out: Option<
     .map_err(|e| MagpieError::Io(e.to_string()))?;
 
     if !no_pdf {
+        if let Some(tx) = &prog {
+            let _ = tx.send("rendering PDF…".into());
+        }
         let pdf_path = dir.join("manual.pdf");
         render_pdf(&doc.query, &doc.pages, &doc.hosts, &pdf_path)?;
     }
 
+    if let Some(tx) = &prog {
+        let _ = tx.send("done".into());
+    }
     Ok(dir)
 }

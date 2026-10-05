@@ -8,17 +8,23 @@ fn esc(s: &str) -> String {
 }
 
 fn wrap(s: &str, width: usize) -> Vec<String> {
+    // width in chars (not bytes) — multibyte safe
     let mut lines = vec![];
     let mut cur = String::new();
+    let mut cur_n: usize = 0;
     for w in s.split_whitespace() {
-        if cur.len() + w.len() + 1 > width && !cur.is_empty() {
+        let wn = w.chars().count();
+        if cur_n + wn + 1 > width && !cur.is_empty() {
             lines.push(cur.clone());
             cur.clear();
+            cur_n = 0;
         }
         if !cur.is_empty() {
             cur.push(' ');
+            cur_n += 1;
         }
         cur.push_str(w);
+        cur_n += wn;
     }
     if !cur.is_empty() {
         lines.push(cur);

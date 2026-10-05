@@ -24,7 +24,7 @@ async fn run(c: Cli) -> anyhow::Result<()> {
     if let Some(Cmd::Browse { rest, dump }) = c.cmd.clone() {
         let url = if rest.is_empty() { String::new() } else { rest.split_whitespace().last().unwrap_or("").to_string() };
         if dump && !url.is_empty() {
-            let pages = crate::crawl::crawl_urls(&[url]).await;
+            let pages = crate::crawl::crawl_urls(&[url], None).await;
             if let Some(p) = pages.first() {
                 println!("{}\n\n{}", p.title, p.text.chars().take(6000).collect::<String>());
                 return Ok(());
