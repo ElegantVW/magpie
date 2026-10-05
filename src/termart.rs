@@ -185,6 +185,41 @@ pub fn box_frame(body: &[String], title: &str, subtitle: &str, width: usize) -> 
     out.join("\n")
 }
 
+/// Exact-height panel: top + padded/truncated middle + bottom.
+/// Focus brightens accent + `► ` prefix like house `panel(focus=...)`.
+pub fn panel(body: &[String], title: &str, width: usize, height: Option<usize>, focus: bool) -> String {
+    let acc = if focus { PINK } else { PINK_DIM };
+    let t = if focus && !title.is_empty() && !title.starts_with('►') {
+        format!("► {title}")
+    } else {
+        title.to_string()
+    };
+    let framed = box_frame(body, &t, "", width);
+    let Some(h) = height else {
+        return framed;
+    };
+    let mut lines: Vec<String> = framed.split('\n').map(|s| s.to_string()).collect();
+    if lines.len() < 2 {
+        return framed;
+    }
+    let (top, bot) = (lines[0].clone(), lines[lines.len() - 1].clone());
+    let mut mid = lines[1..lines.len() - 1].to_vec();
+    let need = h.saturating_sub(2);
+    let inner = width.saturating_sub(2).max(1);
+    let body_w = inner.saturating_sub(2).max(1);
+    let blank = format!("{} {} {}", paint("│", &[acc]), " ".repeat(body_w), paint("│", &[acc]));
+    if mid.len() > need {
+        mid.truncate(need);
+    } else {
+        while mid.len() < need {
+            mid.push(blank.clone());
+        }
+    }
+    let mut out = vec![top];
+    out.extend(mid);
+    out.push(bot);
+    out.join("\n")
+}
 /// House signature footer: `─ ✦ evenweaker ✦ ──` centered, dim.
 pub fn signature(width: usize) -> String {
     let core = "─ ✦ evenweaker ✦ ──";
