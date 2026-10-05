@@ -325,7 +325,11 @@ fn draw(
     *last_frame = frame.clone();
     execute!(out, MoveTo(0, 0))?;
     execute!(out, crossterm::terminal::Clear(ClearType::FromCursorDown))?;
-    writeln!(out, "{frame}")?;
+    // Raw mode disables OPOST: bare \n staircases. Emit CRLF like house tty_write.
+    let wire = frame.replace('\n', "\r\n");
+    use std::io::Write as _Write;
+    out.write_all(wire.as_bytes())?;
+    out.write_all(b"\r\n")?;
     out.flush()?;
     Ok(())
 }
