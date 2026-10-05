@@ -14,6 +14,51 @@ pub struct SeekDoc {
     pub warnings: Vec<String>,
 }
 
+fn norm_words(t: &str) -> HashSet<String> {
+    t.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() > 3)
+        .map(|w| w.to_string())
+        .collect()
+}
+
+/// Drop near-duplicate page texts (Jaccard ≥ 0.8 on words), keep the longer.
+fn dedupe_text(pages: &mut Vec<Page>) {
+    let mut keep = vec![true; pages.len()];
+    let sets: Vec<HashSet<String>> = pages.iter().map(|p| norm_words(&p.text)).collect();
+    for i in 0..pages.len() {
+        if !keep[i] {
+            continue;
+        }
+        for j in (i + 1)..pages.len() {
+            if !keep[j] {
+                continue;
+            }
+            let (a, b) = (&sets[i], &sets[j]);
+            if a.is_empty() || b.is_empty() {
+                continue;
+            }
+            let inter = a.intersection(b).count();
+            let union = a.union(b).count();
+            if union > 0 && inter as f64 / union as f64 >= 0.8 {
+                // keep the longer text
+                if pages[i].chars >= pages[j].chars {
+                    keep[j] = false;
+                } else {
+                    keep[i] = false;
+                    break;
+                }
+            }
+        }
+    }
+    let mut k = 0;
+    pages.retain(|_| {
+        let r = keep[k];
+        k += 1;
+        r
+    });
+}
+
 pub async fn run_seek(query: String, depth: String, pages_n: usize, out: Option<String>, no_pdf: bool) -> Result<std::path::PathBuf> {
     run_seek_with_progress(query, depth, pages_n, out, no_pdf, None).await
 }
@@ -54,6 +99,11 @@ pub async fn run_seek_with_progress(
             pages.append(&mut more);
         }
     }
+    // near-duplicate pass: drop pages whose normalized word overlap ≥80%
+    // (locale mirrors that slipped through, e.g. auto-data /en vs /bg)
+    let before = pages.len();
+    dedupe_text(&mut pages);
+    let dropped = before.saturating_sub(pages.len());
     // rank: spec density + length, drop spam hosts already filtered
     // score = chars/1000 + 3*spec_hits (numbers+units), prefer tables
     pages.sort_by_key(|p| {
@@ -90,6 +140,21 @@ pub async fn run_seek_with_progress(
     if wiki_only {
         warnings.push("wikipedia-only; refusing to call this thorough".into());
     }
+    if dropped > 0 {
+        warnings.push(format!("dropped {dropped} near-duplicate mirror page(s)"));
+    }
+    // source-mix requirement for a real manual: want spec-ish + fault/review-ish
+    {
+        let t = pages.iter().map(|p| p.text.to_lowercase()).collect::<Vec<_>>().join("\n");
+        let has_spec = ["ps", "hp", "kw ", "nm ", "mm", "0-100", "g/km"].iter().any(|u| t.contains(u));
+        let has_life = ["fault", "problem", "recall", "review", "common"].iter().any(|u| t.contains(u));
+        if !has_spec {
+            warnings.push("no specification tables found — manual will lack specs".into());
+        }
+        if !has_life {
+            warnings.push("no faults/reviews found — manual will lack reliability content".into());
+        }
+    }
 
     let doc = SeekDoc {
         query: query.clone(),
@@ -121,9 +186,11 @@ pub async fn run_seek_with_progress(
 
     if !no_pdf {
         if let Some(tx) = &prog {
-            let _ = tx.send("rendering PDF…".into());
+            let _ = tx.send("rendering raw dump…".into());
         }
-        let pdf_path = dir.join("manual.pdf");
+        // NOTE: this is a RAW crawl dump, not a manual.
+        // Only `magpie process` / `magpie manual` may write manual.pdf.
+        let pdf_path = dir.join("dump.pdf");
         render_pdf(&doc.query, &doc.pages, &doc.hosts, &pdf_path)?;
     }
 

@@ -34,6 +34,13 @@ async fn run(c: Cli) -> anyhow::Result<()> {
             anyhow::bail!("fetch failed");
         }
     }
+    if let Some(Cmd::Manual { query, out, depth, pages }) = c.cmd.clone() {
+        let dir = crate::seek::run_seek(query.clone(), depth, pages, out, false).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        println!("seek dump -> {}/dump.pdf", dir.display());
+        let dir = crate::process::run_process(dir, None).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        println!("manual -> {}/manual.pdf", dir.display());
+        return Ok(());
+    }
     if let Some(Cmd::Process { dir }) = c.cmd.clone() {
         let dir = crate::process::run_process(std::path::PathBuf::from(dir), None).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
         println!("processed -> {}/processed.json", dir.display());
@@ -44,7 +51,7 @@ async fn run(c: Cli) -> anyhow::Result<()> {
         let dir = crate::seek::run_seek(query.clone(), depth, pages, out, no_pdf).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
         println!("seek done -> {}/seek.json", dir.display());
         if !no_pdf {
-            println!("pdf -> {}/manual.pdf", dir.display());
+            println!("dump pdf -> {}/dump.pdf (raw — run `magpie process` for manual.pdf)", dir.display());
         }
         return Ok(());
     }
@@ -55,7 +62,7 @@ async fn run(c: Cli) -> anyhow::Result<()> {
             return Ok(());
         }
         let dir = crate::seek::run_seek(q, "deep".into(), if c.deep { 12 } else { 8 }, None, false).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        println!("seek done -> {}/manual.pdf", dir.display());
+        println!("seek done -> {}/dump.pdf (raw — `magpie process {}` for manual.pdf)", dir.display(), dir.display());
         return Ok(());
     }
     // plain `magpie` -> TUI with prompt box

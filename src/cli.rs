@@ -50,4 +50,18 @@ pub enum Cmd {
         /// Seek dir (contains seek.json)
         dir: String,
     },
+    /// End-to-end manual: seek (raw dump) + pixie pass (structured manual.pdf)
+    Manual {
+        /// What to seek
+        query: String,
+        /// Output dir (default ~/.cache/magpie/seek/<slug>/)
+        #[arg(long)]
+        out: Option<String>,
+        /// Depth: quick|deep|extreme
+        #[arg(long, default_value = "deep")]
+        depth: String,
+        /// Max pages to fetch
+        #[arg(long, default_value_t = 12)]
+        pages: usize,
+    },
 }

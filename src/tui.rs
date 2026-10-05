@@ -19,6 +19,7 @@ struct EntryRow {
     kind: String,
     title: String,
     url: String,
+    via: String,
     bullets: Vec<String>,
 }
 
@@ -33,6 +34,7 @@ fn load_entries(dir: &PathBuf) -> Vec<EntryRow> {
                     kind: e.get("kind").and_then(|k| k.as_str()).unwrap_or("other").into(),
                     title: e.get("title").and_then(|k| k.as_str()).unwrap_or("").into(),
                     url: e.get("url").and_then(|k| k.as_str()).unwrap_or("").into(),
+                    via: e.get("via").and_then(|k| k.as_str()).unwrap_or("?").into(),
                     bullets: e
                         .get("bullets")
                         .and_then(|b| b.as_array())
@@ -94,7 +96,7 @@ pub async fn run_tui() -> anyhow::Result<()> {
                         if view == View::Entries {
                             // open entry: drop bullets + url into log, back to Log
                             if let Some(e) = entries.get(sel) {
-                                log.push(format!("[{}] {}", e.kind, e.title));
+                                log.push(format!("[{}|{}] {}", e.kind, e.via, e.title));
                                 for b in &e.bullets {
                                     log.push(format!("  • {b}"));
                                 }
@@ -119,7 +121,7 @@ pub async fn run_tui() -> anyhow::Result<()> {
                                     .await
                                     .map_err(|e| e.to_string())
                                 });
-                                seeking = Some(SeekJob { query: q, rx, handle: Some(handle), status: "starting…".into(), proc: false });
+                                seeking = Some(SeekJob { query: q, rx, handle: Some(handle), status: "starting…".into(), kind: JobKind::Seek });
                                 seek_start = Some(std::time::Instant::now());
                                 last_msg_at = Some(std::time::Instant::now());
                                 log.push("seek started… (Esc cancels seek)".into());
@@ -144,7 +146,7 @@ pub async fn run_tui() -> anyhow::Result<()> {
                             let handle = tokio::spawn(async move {
                                 crate::process::run_process(dir, Some(tx)).await.map_err(|e| e.to_string())
                             });
-                            seeking = Some(SeekJob { query: "process".into(), rx, handle: Some(handle), status: "pixie pass…".into(), proc: true });
+                            seeking = Some(SeekJob { query: "process".into(), rx, handle: Some(handle), status: "pixie pass…".into(), kind: JobKind::Process });
                             seek_start = Some(std::time::Instant::now());
                             last_msg_at = Some(std::time::Instant::now());
                             log.push("process started… (Esc cancels)".into());
@@ -266,18 +268,20 @@ pub async fn run_tui() -> anyhow::Result<()> {
             }
             let finished = job.handle.as_ref().map(|h| h.is_finished()).unwrap_or(false);
             if finished {
-                let was_proc = job.proc;
+                let was_manual = !matches!(job.kind, JobKind::Seek);
                 if let Some(h) = job.handle.take() {
                     match h.await {
                         Ok(Ok(dir)) => {
-                            last_pdf = format!("{}/manual.pdf", dir.display());
                             last_dir = Some(dir.clone());
-                            if was_proc {
+                            if was_manual {
+                                last_pdf = format!("{}/manual.pdf", dir.display());
                                 entries = load_entries(&dir);
                                 sel = 0;
-                                log.push(format!("processed {} entries — [e] entries, [Enter] open", entries.len()));
+                                let n_llm = entries.iter().filter(|e| e.via == "llm").count();
+                                log.push(format!("manual ready: {} entries (llm:{n_llm}) — [e] entries", entries.len()));
                             } else {
-                                log.push(format!("done -> {last_pdf} — [p] process"));
+                                last_pdf = format!("{}/dump.pdf", dir.display());
+                                log.push(format!("dump ready -> {last_pdf} — [p] process for manual.pdf"));
                             }
                         }
                         Ok(Err(e)) => log.push(format!("error: {e}")),
@@ -310,7 +314,14 @@ struct SeekJob {
     rx: tokio::sync::mpsc::UnboundedReceiver<String>,
     handle: Option<tokio::task::JoinHandle<std::result::Result<PathBuf, String>>>,
     status: String,
-    proc: bool,
+    kind: JobKind,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum JobKind {
+    Seek,
+    Process,
+    Manual,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -377,7 +388,11 @@ fn draw(
         if stale > 15 {
             body.push("engines may be throttled (DDG/Marginalia). Esc cancels.".into());
         }
-        let title = if job.proc { "Process" } else { "Seek" };
+        let title = match job.kind {
+            JobKind::Manual => "Manual",
+            JobKind::Process => "Process",
+            JobKind::Seek => "Seek",
+        };
         frame.push_str(&crate::termart::panel(&body, title, w, Some(seek_h), false));
         frame.push('\n');
     }
@@ -390,7 +405,7 @@ fn draw(
         let _ = off;
         for (i, e) in entries.iter().enumerate().skip(start).take(end - start) {
             let mark = if i == sel { "►" } else { "·" };
-            rows_v.push(format!("{mark} [{}] {}", e.kind, safe_head(&e.title, 80)));
+            rows_v.push(format!("{mark} [{}|{}] {}", e.kind, e.via, safe_head(&e.title, 72)));
         }
         while rows_v.len() > max_rows {
             rows_v.remove(0);

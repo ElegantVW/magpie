@@ -271,9 +271,11 @@ pub async fn plan_urls(
         if spam_url(&u) {
             continue;
         }
-        if seen.insert(u.clone()) {
-            urls.push(u);
+        // canon dedupe: locale mirrors collapse (es.auto-abc.eu == www.auto-abc.eu)
+        if !seen.insert(canon_url(&u)) {
+            continue;
         }
+        urls.push(u);
         if urls.len() >= max_pages {
             break;
         }
@@ -317,9 +319,10 @@ pub async fn plan_urls(
                 if spam_url(&u) {
                     continue;
                 }
-                if seen.insert(u.clone()) {
-                    urls.push(u);
+                if !seen.insert(canon_url(&u)) {
+                    continue;
                 }
+                urls.push(u);
                 if urls.len() >= max_pages {
                     break;
                 }
@@ -397,13 +400,53 @@ fn spam_url(u: &str) -> bool {
     if spam_host(&host_of(u)) {
         return true;
     }
-    // for-sale / classified paths, even on legit hosts (parkers, rac)
-    lu.contains("/for-sale/")
+    // share / intent / social widgets carry no manual content
+    lu.contains("/intent/")
+        || lu.contains("intent/tweet")
+        || lu.contains("/sharer")
+        || lu.contains("whatsapp")
+        || lu.contains("facebook.com/sharer")
+        || lu.contains("twitter.com/intent")
+        || lu.contains("mailto:")
+        // for-sale / classified paths, even on legit hosts (parkers, rac)
+        || lu.contains("/for-sale/")
         || lu.contains("/srpsearch")
         || lu.contains("/cars-vans-motorbikes/")
         || lu.contains("/used-cars/")
         || lu.contains("/vans-for-sale")
         || lu.contains("usedvfs-")
+}
+
+/// Canonical dedupe key: mirror networks collapse even across TLDs
+/// (www.auto-abc.eu == es.auto-abc.eu == www.auto-abc.lv when paths match;
+/// auto-data.net/en/X == auto-data.net/bg/X).
+fn canon_url(u: &str) -> String {
+    let parsed = match url::Url::parse(u) {
+        Ok(p) => p,
+        Err(_) => return u.to_lowercase(),
+    };
+    let host = parsed.host_str().unwrap_or("").to_lowercase();
+    // site name: second-level label (auto-abc.eu and auto-abc.lv -> auto-abc)
+    let parts: Vec<&str> = host.split('.').filter(|s| !s.is_empty()).collect();
+    let site = if parts.len() >= 2 {
+        parts[parts.len() - 2].to_string()
+    } else {
+        host.clone()
+    };
+    // strip leading 2-letter language path segment (/en/, /bg/, /de/…)
+    let mut path = parsed.path().to_lowercase();
+    if path.len() > 4 {
+        let b = path.as_bytes();
+        if b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2].is_ascii_alphabetic() && b[3] == b'/' {
+            path = path[3..].to_string();
+        }
+    }
+    // cross-TLD collapse only for deep content paths (avoids merging
+    // unrelated same-name domains on short index paths)
+    if path.len() > 8 {
+        return format!("{site}{path}");
+    }
+    format!("{host}{path}")
 }
 
 /// Boost: hosts where specs / reliability / dimensions actually live.
@@ -443,7 +486,7 @@ pub async fn expand_second_hop(query: &str, pages: &[Page], max_extra: usize) ->
         .filter(|t| t.len() > 2)
         .map(|t| t.to_string())
         .collect();
-    let mut seen: HashSet<String> = pages.iter().map(|p| p.url.clone()).collect();
+    let mut seen: HashSet<String> = pages.iter().map(|p| canon_url(&p.url)).collect();
     let mut scored: Vec<(i32, String)> = vec![];
     let re = Regex::new(r#"(?i)href\s*=\s*"(https?://[^"]+)""#).unwrap();
     for p in pages {
@@ -465,7 +508,7 @@ pub async fn expand_second_hop(query: &str, pages: &[Page], max_extra: usize) ->
                     continue;
                 }
             }
-            if !seen.insert(u.clone()) {
+            if !seen.insert(canon_url(&u)) {
                 continue;
             }
             let lu = u.to_lowercase();

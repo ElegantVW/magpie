@@ -44,6 +44,7 @@ pub struct ManualEntry {
     pub kind: String,
     pub title: String,
     pub url: String,
+    pub via: String,
     pub bullets: Vec<String>,
     pub specs: Vec<[String; 2]>,
 }
@@ -147,7 +148,7 @@ pub fn render_manual(query: &str, entries: &[ManualEntry], hosts: &[String], out
     sec_starts.push(("Sources".into(), doc.len()));
     h1(&mut doc, &mut sec_no, "Sources");
     for (n, e) in entries.iter().enumerate() {
-        body(&mut doc, &format!("{}. [{}] {} — {}", n + 1, e.kind, truncate(&e.title, 70), e.url));
+        body(&mut doc, &format!("{}. [{}|{}] {} — {}", n + 1, e.kind, e.via, truncate(&e.title, 60), e.url));
     }
 
     // Pass 2: paginate content (50 units/page), map sections to pages.
@@ -184,11 +185,14 @@ pub fn render_manual(query: &str, entries: &[ManualEntry], hosts: &[String], out
     // Emit: cover stream, TOC stream, then content streams.
     let mut streams: Vec<String> = vec![];
     let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let n_llm = entries.iter().filter(|e| e.via == "llm").count();
+    let n_heur = entries.len().saturating_sub(n_llm);
     let mut cover = String::new();
     cover.push_str("BT /F1 18 Tf 50 800 Td (magpie manual) Tj ET\n");
     cover.push_str(&format!("BT /F1 13 Tf 50 776 Td ({}) Tj ET\n", esc(&truncate(query, 80))));
     cover.push_str(&format!("BT /F1 9 Tf 50 758 Td ({} entries, {} hosts, {}) Tj ET\n", entries.len(), hosts.len(), date));
-    cover.push_str(&format!("BT /F1 8 Tf 50 742 Td ({}) Tj ET\n", esc(&truncate(&hosts.join(", "), 110))));
+    cover.push_str(&format!("BT /F1 8 Tf 50 744 Td (via llm: {n_llm}, via heuristic: {n_heur}) Tj ET\n"));
+    cover.push_str(&format!("BT /F1 8 Tf 50 730 Td ({}) Tj ET\n", esc(&truncate(&hosts.join(", "), 110))));
     cover.push_str("BT /F1 8 Tf 50 716 Td (Grouped spec / fault / review / dimensions. Verify critical data by VIN.) Tj ET\n");
     streams.push(cover);
     let mut tocs = String::new();
@@ -225,8 +229,9 @@ pub fn render_pdf(query: &str, pages: &[Page], hosts: &[String], out: &std::path
     let mut streams: Vec<String> = vec![];
     {
         let mut cover = String::new();
-        cover.push_str("BT /F1 18 Tf 50 800 Td (magpie seek) Tj ET\n");
-        cover.push_str(&format!("BT /F1 13 Tf 50 778 Td ({}) Tj ET\n", esc(&truncate(query, 80))));
+        cover.push_str("BT /F1 18 Tf 50 800 Td (magpie raw dump) Tj ET\n");
+        cover.push_str("BT /F1 11 Tf 50 778 Td (NOT a manual) Tj ET\n");
+        cover.push_str(&format!("BT /F1 13 Tf 50 758 Td ({}) Tj ET\n", esc(&truncate(query, 80))));
         cover.push_str(&format!(
             "BT /F1 9 Tf 50 760 Td ({} pages, {} hosts. Local minimal-PDF build.) Tj ET\n",
             pages.len(),

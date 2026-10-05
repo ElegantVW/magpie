@@ -9,11 +9,12 @@ struct SeekPage {
     text: String,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, Clone)]
 struct Entry {
     url: String,
     title: String,
     kind: String,
+    via: String,
     bullets: Vec<String>,
     specs: Vec<[String; 2]>,
 }
@@ -22,57 +23,95 @@ fn llm_url() -> String {
     std::env::var("PIXIE_LLM_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into())
 }
 
-/// One quick LLM task per entry, sequential. Falls back to heuristic when LLM down.
-async fn process_one(client: &reqwest::Client, base: &str, title: &str, text: &str) -> (String, Vec<String>, Vec<[String; 2]>) {
-    let excerpt: String = text.chars().take(1200).collect();
-    let prompt = format!(
-        "Classify this page for a vehicle manual. Reply ONLY JSON {{\"kind\":\"spec|fault|review|dimensions|other\",\"bullets\":[\"...\",\"...\",\"...\"],\"specs\":[[\"k\",\"v\"]]}} max 3 bullets, max 6 specs.\nTitle: {title}\nURL: {base}\nText:\n{excerpt}"
-    );
-    let body = serde_json::json!({"prompt": prompt, "n_predict": 192, "temperature": 0.1, "cache_prompt": true});
-    let url = format!("{base}/completion", base = llm_url().trim_end_matches('/'));
-    let txt = match tokio::time::timeout(
-        std::time::Duration::from_secs(25),
-        client.post(&url).json(&body).send(),
+const VALID_KINDS: &[&str] = &["spec", "fault", "review", "dimensions", "other"];
+
+/// One quick LLM task per entry via OpenAI chat endpoint with enforced
+/// `response_format: json_object`. Returns (kind, bullets, specs, via).
+async fn chat_once(client: &reqwest::Client, url: &str, body: &serde_json::Value) -> std::result::Result<String, String> {
+    // NOTE: llama-server answers after full generation (no stream), so the
+    // send() budget must cover CPU prompt eval + generation (~60-90s).
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(150),
+        client.post(url).json(body).send(),
     )
     .await
-    {
-        Ok(Ok(r)) => match tokio::time::timeout(std::time::Duration::from_secs(20), r.text()).await {
-            Ok(Ok(t)) => t,
-            _ => String::new(),
-        },
-        _ => String::new(),
-    };
-    // llama /completion returns {"content":"..."} — extract first {...}
-    if let Some(s) = txt.find('{') {
-        if let Some(e) = txt.rfind('}') {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt[s..=e]) {
-                let kind = v.get("kind").and_then(|k| k.as_str()).unwrap_or("other").to_string();
-                let bullets: Vec<String> = v
-                    .get("bullets")
-                    .and_then(|b| b.as_array())
-                    .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).take(3).collect())
-                    .unwrap_or_default();
-                let specs: Vec<[String; 2]> = v
-                    .get("specs")
-                    .and_then(|b| b.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|x| {
-                                let k = x.get(0)?.as_str()?.to_string();
-                                let v = x.get(1)?.as_str()?.to_string();
-                                Some([k, v])
-                            })
-                            .take(6)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                if !bullets.is_empty() || !specs.is_empty() {
-                    return (kind, bullets, specs);
-                }
-            }
-        }
+    .map_err(|e| format!("send:{e}"))?
+    .map_err(|e| format!("send:{e}"))?;
+    tokio::time::timeout(std::time::Duration::from_secs(30), resp.text())
+        .await
+        .map_err(|e| format!("body:{e}"))?
+        .map_err(|e| format!("body:{e}"))
+}
+
+async fn process_one(client: &reqwest::Client, base: &str, title: &str, text: &str) -> (String, Vec<String>, Vec<[String; 2]>, String) {
+    let excerpt: String = text.chars().take(800).collect();
+    let sys = "You classify web pages for a vehicle owner's manual. Reply with ONLY a single JSON object, no other text.";
+    let user = format!(
+        "{{\"task\": \"classify\", \"title\": \"{title}\", \"url\": \"{base}\", \"text\": \"{excerpt}\", \"want\": {{\"kind\": \"spec|fault|review|dimensions|other\", \"bullets\": [\"up to 3 facts\"], \"specs\": [[\"key\", \"value\"]]}}}}"
+    );
+    let body = serde_json::json!({
+        "messages": [{"role": "system", "content": sys}, {"role": "user", "content": user}],
+        "temperature": 0.1,
+        "max_tokens": 220,
+        "response_format": {"type": "json_object"},
+    });
+    let url = format!("{base}/v1/chat/completions", base = llm_url().trim_end_matches('/'));
+    let mut attempt = chat_once(client, &url, &body).await;
+    if attempt.is_err() {
+        // model may have been idle-evicted mid-run: summon once, retry once
+        let _ = tokio::process::Command::new("menagerie")
+            .args(["ensure", "pixie"])
+            .output()
+            .await;
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        attempt = chat_once(client, &url, &body).await;
     }
-    heuristic(title, &excerpt)
+    let txt = match attempt {
+        Ok(t) => t,
+        Err(e) => return with_via(heuristic(title, &excerpt), &format!("heuristic:{e}").chars().take(48).collect::<String>()),
+    };
+    // choices[0].message.content holds the JSON object
+    let content = serde_json::from_str::<serde_json::Value>(&txt)
+        .ok()
+        .and_then(|v| v["choices"][0]["message"]["content"].as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
+    let parsed: Option<(String, Vec<String>, Vec<[String; 2]>)> = (|| {
+        let v: serde_json::Value = serde_json::from_str(content.trim()).ok()?;
+        let raw_kind = v.get("kind").and_then(|k| k.as_str()).unwrap_or("other").to_lowercase();
+        let kind = if VALID_KINDS.contains(&raw_kind.as_str()) { raw_kind } else { "other".into() };
+        let bullets: Vec<String> = v
+            .get("bullets")
+            .and_then(|b| b.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.chars().take(200).collect())).take(3).collect())
+            .unwrap_or_default();
+        let specs: Vec<[String; 2]> = v
+            .get("specs")
+            .and_then(|b| b.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| {
+                        Some([
+                            x.get(0)?.as_str()?.chars().take(28).collect(),
+                            x.get(1)?.as_str()?.chars().take(60).collect(),
+                        ])
+                    })
+                    .take(6)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if bullets.is_empty() && specs.is_empty() {
+            return None;
+        }
+        Some((kind, bullets, specs))
+    })();
+    match parsed {
+        Some((k, b, s)) => (k, b, s, "llm".into()),
+        None => with_via(heuristic(title, &excerpt), "heuristic:parse"),
+    }
+}
+
+fn with_via(h: (String, Vec<String>, Vec<[String; 2]>), via: &str) -> (String, Vec<String>, Vec<[String; 2]>, String) {
+    (h.0, h.1, h.2, via.into())
 }
 
 fn heuristic(title: &str, text: &str) -> (String, Vec<String>, Vec<[String; 2]>) {
@@ -125,6 +164,19 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
     let query = v.get("query").and_then(|q| q.as_str()).unwrap_or("seek").to_string();
     let arr = v.get("pages").and_then(|p| p.as_array()).cloned().unwrap_or_default();
     let total = arr.len();
+    // summon the local model first (menagerie idle-evicts); heuristic tags the fallback
+    if let Some(tx) = &prog {
+        let _ = tx.send("ensure pixie model…".into());
+    }
+    let ensured = tokio::process::Command::new("menagerie")
+        .args(["ensure", "pixie"])
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if let Some(tx) = &prog {
+        let _ = tx.send(if ensured { "model ready".into() } else { "model summon failed — heuristic fallback".into() });
+    }
     let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().map_err(|e| MagpieError::Network(e.to_string()))?;
     let mut entries = vec![];
     for (i, p) in arr.iter().enumerate() {
@@ -134,8 +186,8 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
         if let Some(tx) = &prog {
             let _ = tx.send(format!("pixie {}/{} {}", i + 1, total, url.chars().take(50).collect::<String>()));
         }
-        let (kind, bullets, specs) = process_one(&client, &url, &title, &text).await;
-        entries.push(Entry { url, title, kind, bullets, specs });
+        let (kind, bullets, specs, via) = process_one(&client, &url, &title, &text).await;
+        entries.push(Entry { url, title, kind, via, bullets, specs });
     }
     let out = serde_json::json!({
         "query": query,
@@ -153,6 +205,7 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
             kind: e.kind.clone(),
             title: e.title.clone(),
             url: e.url.clone(),
+            via: e.via.clone(),
             bullets: e.bullets.clone(),
             specs: e.specs.clone(),
         })
