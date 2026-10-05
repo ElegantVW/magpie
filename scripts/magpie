@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# magpie — thin launcher (never a prebuilt ELF in git)
+# Discovery: MAGPIE_BIN → ~/.local/lib/faeos/magpie → sibling tree
+set -euo pipefail
+
+USER_HOME="${HOME}"
+if [[ -n "${SUDO_USER:-}" ]]; then
+  USER_HOME="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || true)"
+  USER_HOME="${USER_HOME:-$HOME}"
+fi
+
+CANDIDATES=(
+  "${MAGPIE_BIN:-}"
+  "$USER_HOME/.local/lib/faeos/magpie"
+  /usr/local/lib/faeos/magpie
+  "$USER_HOME/magpie/target/release/magpie"
+  "${MAGPIE_ROOT:-}/target/release/magpie"
+)
+here="$(cd "$(dirname "$0")" && pwd)"
+if [[ -x "$here/../target/release/magpie" ]]; then
+  CANDIDATES+=("$here/../target/release/magpie")
+fi
+
+for c in "${CANDIDATES[@]}"; do
+  [[ -n "$c" && -x "$c" ]] || continue
+  exec "$c" "$@"
+done
+
+echo "magpie: engine not built yet." >&2
+echo "  next:   cd ~/magpie && ./build.sh install" >&2
+exit 127

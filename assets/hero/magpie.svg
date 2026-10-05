@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="360" viewBox="0 0 720 360">
+<rect width="720" height="360" fill="#1A1218"/>
+<g font-family="DejaVu Sans Mono, Menlo, Consolas, monospace" font-size="26" text-anchor="middle">
+<text x="360" y="101" fill="#90B8D8">  /\  </text>
+<text x="360" y="131" fill="#90B8D8"> (\/) </text>
+<text x="360" y="161" fill="#90B8D8"> &lt;&gt;&gt; </text>
+<text x="360" y="191" fill="#90B8D8">/    \</text>
+<text x="360" y="221" fill="#90B8D8">\    /</text>
+</g>
+<text x="360" y="307" fill="#F0E4EE" font-family="DejaVu Sans Mono, Menlo, Consolas, monospace" font-size="30" font-weight="bold" text-anchor="middle">Magpie</text>
+<text x="360" y="337" fill="#6B6FA8" font-family="DejaVu Sans Mono, monospace" font-size="16" text-anchor="middle">thorough seeker</text>
+</svg>
