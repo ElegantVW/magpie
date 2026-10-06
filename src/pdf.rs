@@ -213,7 +213,7 @@ pub fn render_manual(query: &str, chapters: &[String], entries: &[ManualEntry], 
     cover.push_str(&format!("BT /F1 9 Tf 50 758 Td ({} entries, {} hosts, {}) Tj ET\n", entries.len(), hosts.len(), date));
     cover.push_str(&format!("BT /F1 8 Tf 50 744 Td (via llm: {n_llm}, via heuristic: {n_heur}) Tj ET\n"));
     cover.push_str(&format!("BT /F1 8 Tf 50 730 Td ({}) Tj ET\n", esc(&truncate(&hosts.join(", "), 110))));
-    cover.push_str("BT /F1 8 Tf 50 716 Td (Grouped spec / fault / review / dimensions. Verify critical data by VIN.) Tj ET\n");
+    cover.push_str("BT /F1 8 Tf 50 716 Td (Grouped by outline chapters. Verify critical data independently.) Tj ET\n");
     streams.push(cover);
     let mut tocs = String::new();
     tocs.push_str("BT /F1 13 Tf 50 800 Td (Contents) Tj ET\n");
