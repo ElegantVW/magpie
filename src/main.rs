@@ -23,6 +23,30 @@ async fn main() {
 
 async fn run(c: Cli) -> anyhow::Result<()> {
     // compat: `magpie browse --dump URL`
+    if let Some(Cmd::Open { dir }) = c.cmd.clone() {
+        let dir = match dir {
+            Some(d) => std::path::PathBuf::from(d),
+            None => crate::store::latest_seek_dir().ok_or_else(|| anyhow::anyhow!("no seeks yet under ~/.cache/magpie/seek/"))?,
+        };
+        let pdf = {
+            let m = dir.join("manual.pdf");
+            if m.is_file() { m } else { dir.join("dump.pdf") }
+        };
+        if !pdf.is_file() {
+            anyhow::bail!("no PDF yet in {} — run `magpie manual` first", dir.display());
+        }
+        // detached viewer, like house openers
+        tokio::process::Command::new("xdg-open")
+            .arg(&pdf)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("xdg-open failed: {e}"))?;
+        println!("opened {}", pdf.display());
+        return Ok(());
+    }
+    // compat: `magpie browse --dump URL`
     if let Some(Cmd::Browse { rest, dump }) = c.cmd.clone() {
         let url = if rest.is_empty() { String::new() } else { rest.split_whitespace().last().unwrap_or("").to_string() };
         if dump && !url.is_empty() {

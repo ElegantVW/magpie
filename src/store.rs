@@ -40,3 +40,14 @@ pub fn seek_dir(query: &str, out: Option<String>) -> PathBuf {
     }
     cache_dir().join("seek").join(slugify(query))
 }
+
+/// Most recently modified seek dir (for `magpie open` with no args).
+pub fn latest_seek_dir() -> Option<PathBuf> {
+    let base = cache_dir().join("seek");
+    std::fs::read_dir(base)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
+        .map(|e| e.path())
+}

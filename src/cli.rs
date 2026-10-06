@@ -45,6 +45,11 @@ pub enum Cmd {
         #[arg(long, default_value_t = false)]
         dump: bool,
     },
+    /// Open the manual (fallback dump) for a seek dir in the PDF viewer
+    Open {
+        /// Seek dir (default: most recent under ~/.cache/magpie/seek/)
+        dir: Option<String>,
+    },
     /// Pixie pass: one quick local AI task per crawled entry, then structured PDF
     Process {
         /// Seek dir (contains seek.json)

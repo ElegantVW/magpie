@@ -98,6 +98,23 @@ async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, ba
         "temperature": 0.1,
         "max_tokens": 220,
         "response_format": {"type": "json_object"},
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "classify_entry",
+                "description": "File one crawled page into the vehicle manual",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"type": "string", "enum": ["spec", "fault", "review", "dimensions", "other"]},
+                        "bullets": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
+                        "specs": {"type": "array", "items": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 2}, "maxItems": 6}
+                    },
+                    "required": ["kind", "bullets", "specs"]
+                }
+            }
+        }],
+        "tool_choice": {"type": "function", "function": {"name": "classify_entry"}},
     });
     let url = format!("{base}/v1/chat/completions", base = endpoint.trim_end_matches('/'));
     let mut attempt = chat_once(client, &url, &body).await;
@@ -117,13 +134,40 @@ async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, ba
         Ok(t) => t,
         Err(e) => return with_via(heuristic(title, &excerpt), &format!("heuristic:{e}").chars().take(48).collect::<String>()),
     };
-    // choices[0].message.content holds the JSON object
-    let content = serde_json::from_str::<serde_json::Value>(&txt)
-        .ok()
+    // tool contract first: choices[0].message.tool_calls[0].function.arguments
+    // (real function call, not prose). This server build may instead emit
+    // the call as content {"name":..,"arguments":{..}} — accept that too.
+    // Content-JSON last. Heuristic never silent.
+    let root: Option<serde_json::Value> =
+        serde_json::from_str::<serde_json::Value>(&txt).ok();
+    let tool_args = root
+        .as_ref()
+        .and_then(|v| {
+            v["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .map(|s| s.to_string())
+        })
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    let content = root
+        .as_ref()
         .and_then(|v| v["choices"][0]["message"]["content"].as_str().map(|s| s.to_string()))
         .unwrap_or_default();
-    let parsed: Option<(String, Vec<String>, Vec<[String; 2]>)> = (|| {
-        let v: serde_json::Value = serde_json::from_str(content.trim()).ok()?;
+    // unwrap this server's {"name","arguments"} envelope when present
+    let enveloped = serde_json::from_str::<serde_json::Value>(content.trim())
+        .ok()
+        .and_then(|v| {
+            if v.get("name").is_some() && v.get("arguments").is_some() {
+                Some(v["arguments"].clone())
+            } else {
+                Some(v)
+            }
+        });
+    let parsed: Option<(String, Vec<String>, Vec<[String; 2]>, bool)> = (|| {
+        // prefer the tool call; then the envelope; fall back to raw content JSON
+        let (v, tooled): (serde_json::Value, bool) = match tool_args {
+            Some(t) => (t, true),
+            None => (enveloped?, false),
+        };
         let raw_kind = v.get("kind").and_then(|k| k.as_str()).unwrap_or("other").to_lowercase();
         let kind = if VALID_KINDS.contains(&raw_kind.as_str()) { raw_kind } else { "other".into() };
         let bullets: Vec<String> = v
@@ -137,10 +181,15 @@ async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, ba
             .map(|a| {
                 a.iter()
                     .filter_map(|x| {
-                        Some([
-                            x.get(0)?.as_str()?.chars().take(28).collect(),
-                            x.get(1)?.as_str()?.chars().take(60).collect(),
-                        ])
+                        if let Some(s) = x.as_str() {
+                            // lenient: flat strings become spec rows
+                            Some(["spec".to_string(), s.chars().take(88).collect()])
+                        } else {
+                            Some([
+                                x.get(0)?.as_str()?.chars().take(28).collect(),
+                                x.get(1)?.as_str()?.chars().take(60).collect(),
+                            ])
+                        }
                     })
                     .take(6)
                     .collect()
@@ -149,10 +198,11 @@ async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, ba
         if bullets.is_empty() && specs.is_empty() {
             return None;
         }
-        Some((kind, bullets, specs))
+        Some((kind, bullets, specs, tooled))
     })();
     match parsed {
-        Some((k, b, s)) => (k, b, s, via_tag.into()),
+        Some((k, b, s, true)) => (k, b, s, format!("{via_tag}:tool")),
+        Some((k, b, s, false)) => (k, b, s, format!("{via_tag}:json")),
         None => with_via(heuristic(title, &excerpt), "heuristic:parse"),
     }
 }

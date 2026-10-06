@@ -222,6 +222,25 @@ async fn marginalia_search(query: &str, n: usize) -> Vec<String> {
     out
 }
 
+/// Marque aliases: the same car hides under other badges
+/// (Opel↔Vauxhall, Chevrolet↔Holden). Fan-out finds those pages.
+fn alias_queries(query: &str) -> Vec<String> {
+    const PAIRS: &[(&str, &str)] = &[
+        ("opel", "vauxhall"),
+        ("vauxhall", "opel"),
+        ("chevrolet", "holden"),
+        ("holden", "chevrolet"),
+    ];
+    let lq = query.to_lowercase();
+    let mut out = vec![];
+    for (a, b) in PAIRS {
+        if lq.contains(a) {
+            out.push(lq.replacen(a, b, 1));
+        }
+    }
+    out
+}
+
 fn wikipedia_api(query: &str) -> String {
     format!(
         "https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={}&format=json&srlimit=5",
@@ -390,7 +409,7 @@ async fn sitemap_urls(host: &str, tokens: &[String], limit: usize) -> Vec<String
 
 /// Common Crawl: index API → WARC byte-range fetch → gunzip → extract.
 /// Bulk web without search engines. `prefix` like "ultimatespecs.com/car-specs/Opel/".
-async fn common_crawl(prefix: &str, tokens: &[String], limit: usize) -> Vec<Page> {
+async fn common_crawl(query: &str, prefix: &str, limit: usize) -> Vec<Page> {
     let c = client();
     let idx = format!(
         "https://index.commoncrawl.org/CC-MAIN-2025-30-index?url={}%2F*&output=json&filter=status%3A200&limit=40",
@@ -410,8 +429,7 @@ async fn common_crawl(prefix: &str, tokens: &[String], limit: usize) -> Vec<Page
             Err(_) => continue,
         };
         let url = v.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string();
-        let lu = url.to_lowercase();
-        if !tokens.iter().any(|t| lu.contains(t.as_str())) {
+        if !model_gate(query, &url) {
             continue;
         }
         let (filename, offset, length) = match (
@@ -464,6 +482,43 @@ async fn common_crawl(prefix: &str, tokens: &[String], limit: usize) -> Vec<Page
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
     out
+}
+
+/// Relevance gate: a URL must carry the query's model token (longest
+/// alpha token, e.g. `corsa`, `transit`) plus at least one more query
+/// token. Kills single-token drift (a Mondeo page matching only
+/// year+fuel, a Liebao page matching only the year).
+fn model_tokens(query: &str) -> Vec<String> {
+    let mut alphas: Vec<String> = query
+        .to_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| t.len() >= 4 && t.chars().any(|c| c.is_ascii_alphabetic()))
+        .map(|t| t.to_string())
+        .collect();
+    alphas.sort_by_key(|t| std::cmp::Reverse(t.len()));
+    alphas.dedup();
+    alphas
+}
+
+fn model_gate(query: &str, url: &str) -> bool {
+    let tokens: Vec<String> = query
+        .to_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| t.len() > 2)
+        .map(|t| t.to_string())
+        .collect();
+    let lu = url.to_lowercase();
+    let hits = tokens.iter().filter(|t| lu.contains(t.as_str())).count();
+    if hits < 2 {
+        return false;
+    }
+    let core = model_tokens(query);
+    if core.is_empty() {
+        return true;
+    }
+    // longest token wins; ties all count as core
+    let maxlen = core.iter().map(|t| t.len()).max().unwrap_or(0);
+    core.iter().filter(|t| t.len() == maxlen).any(|t| lu.contains(t.as_str()))
 }
 
 /// Wikipedia family: en/de/pl/it opensearch (proven car-spec value:
@@ -569,11 +624,26 @@ pub async fn plan_urls(
     };
     send(&format!("search: marginalia got {}", mar.len()));
 
-    for u in ddg.into_iter().chain(mar) {
-        if spam_url(&u) {
-            continue;
+    let mut raw: Vec<String> = ddg.into_iter().chain(mar).collect();
+    // relevance gate for unscoped engine hits (wikipedia/verticals exempt)
+    let gated: Vec<String> = raw.drain(..).filter(|u| !spam_url(u) && model_gate(query, u)).collect();
+    let chosen: Vec<String> = if gated.len() >= 3 {
+        gated
+    } else {
+        send("search: model gate relaxed (<3 gated hits)");
+        let mut backfill: Vec<String> = gated;
+        for u in raw {
+            if backfill.len() >= 3 || seen.contains(&canon_url(&u)) {
+                continue;
+            }
+            if spam_url(&u) {
+                continue;
+            }
+            backfill.push(u);
         }
-        // canon dedupe: locale mirrors collapse (es.auto-abc.eu == www.auto-abc.eu)
+        backfill
+    };
+    for u in chosen {
         if !seen.insert(canon_url(&u)) {
             continue;
         }
@@ -680,7 +750,7 @@ pub async fn plan_urls(
         send("search: commoncrawl…");
         for h in hosts.iter().take(2) {
             let prefix = h.trim_start_matches("www.").to_string() + "/";
-            for p in common_crawl(&prefix, &tokens, 2).await {
+            for p in common_crawl(query, &prefix, 2).await {
                 if spam_url(&p.url) || !seen.insert(canon_url(&p.url)) {
                     continue;
                 }
@@ -697,8 +767,15 @@ pub async fn plan_urls(
             send("search: wikidata got 1");
         }
     }
-    if depth != "quick" && urls.len() < max_pages {
-        for variant in [format!("{query} specifications"), format!("{query} problems")] {
+    if depth != "quick" && urls.len() < max_pages + 4 {
+        let mut variants = vec![format!("{query} specifications"), format!("{query} problems")];
+        for a in alias_queries(query) {
+            variants.push(a);
+        }
+        for variant in variants {
+            if urls.len() >= max_pages + 4 {
+                break;
+            }
             send(&format!("search: variant {variant}…"));
             let extra = match tokio::time::timeout(std::time::Duration::from_secs(20), ddg_search(&variant, 3)).await {
                 Ok(v) => v,
@@ -709,6 +786,9 @@ pub async fn plan_urls(
             };
             for u in extra {
                 if spam_url(&u) {
+                    continue;
+                }
+                if !model_gate(&variant, &u) && !model_gate(query, &u) {
                     continue;
                 }
                 if !seen.insert(canon_url(&u)) {
@@ -872,12 +952,6 @@ fn boost_host(h: &str) -> i32 {
 /// boosted hosts rank first.
 pub async fn expand_second_hop(query: &str, pages: &[Page], max_extra: usize) -> Vec<String> {
     use std::collections::HashSet;
-    let tokens: Vec<String> = query
-        .to_lowercase()
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|t| t.len() > 2)
-        .map(|t| t.to_string())
-        .collect();
     let mut seen: HashSet<String> = pages.iter().map(|p| canon_url(&p.url)).collect();
     let mut scored: Vec<(i32, String)> = vec![];
     let re = Regex::new(r#"(?i)href\s*=\s*"(https?://[^"]+)""#).unwrap();
@@ -904,7 +978,8 @@ pub async fn expand_second_hop(query: &str, pages: &[Page], max_extra: usize) ->
                 continue;
             }
             let lu = u.to_lowercase();
-            if !tokens.iter().any(|t| lu.contains(t.as_str())) {
+            if !model_gate(query, &u) {
+                let _ = lu;
                 continue;
             }
             let mut score = boost_host(&host_of(&u));

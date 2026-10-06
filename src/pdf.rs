@@ -73,10 +73,29 @@ fn body(doc: &mut Vec<Line>, text: &str) {
     }
 }
 
+/// Source URLs have no spaces — break after `/` with hanging indent
+/// so they never spill unindented onto the next line.
+fn source_line(doc: &mut Vec<Line>, url: &str) {
+    const W: usize = 95;
+    let prefix = "Source: ";
+    let mut line = prefix.to_string();
+    for (i, seg) in url.split('/').enumerate() {
+        let piece = if i == 0 { seg.to_string() } else { format!("/{seg}") };
+        if line.chars().count() + piece.chars().count() > W && line.len() > prefix.len() {
+            doc.push(Line { text: line, size: 8.0, bold: false, units: 1 });
+            line = format!("    {piece}");
+        } else {
+            line.push_str(&piece);
+        }
+    }
+    doc.push(Line { text: line, size: 8.0, bold: false, units: 1 });
+}
+
 fn bullets(doc: &mut Vec<Line>, items: &[String]) {
+    // NOTE: WinAnsi Helvetica has no U+2022 • (renders as ¢) — use ASCII dash.
     for b in items {
         for (i, ln) in wrap(b, 92).iter().enumerate() {
-            let t = if i == 0 { format!("• {ln}") } else { format!("  {ln}") };
+            let t = if i == 0 { format!("- {ln}") } else { format!("  {ln}") };
             doc.push(Line { text: t, size: 8.5, bold: false, units: 1 });
         }
     }
@@ -129,7 +148,7 @@ pub fn render_manual(query: &str, entries: &[ManualEntry], hosts: &[String], out
         h1(&mut doc, &mut sec_no, titles[*i]);
         for (n, e) in group.iter().enumerate() {
             h2(&mut doc, &format!("[{}] {}", n + 1, truncate(&e.title, 85)));
-            body(&mut doc, &format!("Source: {}", e.url));
+            source_line(&mut doc, &e.url);
             if !e.bullets.is_empty() {
                 bullets(&mut doc, &e.bullets);
             }
@@ -187,7 +206,7 @@ pub fn render_manual(query: &str, entries: &[ManualEntry], hosts: &[String], out
     // Emit: cover stream, TOC stream, then content streams.
     let mut streams: Vec<String> = vec![];
     let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    let n_llm = entries.iter().filter(|e| e.via == "llm").count();
+    let n_llm = entries.iter().filter(|e| e.via.starts_with("llm")).count();
     let n_heur = entries.len().saturating_sub(n_llm);
     let mut cover = String::new();
     cover.push_str("BT /F1 18 Tf 50 800 Td (magpie manual) Tj ET\n");

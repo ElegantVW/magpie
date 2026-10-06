@@ -39,7 +39,7 @@ magpie manual "query" --depth deep --pages 12   # end-to-end: dump + manual.pdf
 magpie browse --dump https://example.com   # compat for pixie
 ```
 
-TUI keys: type + `Enter` seek, `p` pixie pass on last result, `e` entry list (`[kind|via]`), `Enter` opens entry, `Esc` cancel/quit.
+TUI keys: type + `Enter` seek, `p` pixie pass on last result, `e` entry list (`[kind|via]`), `Enter` opens entry, `Ctrl-O` opens the PDF, `Esc` cancel/quit.
 `seek` writes `dump.pdf` (RAW DUMP, never a manual); only `process`/`manual` write `manual.pdf`.
 
 ## Thoroughness

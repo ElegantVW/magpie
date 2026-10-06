@@ -141,6 +141,22 @@ pub async fn run_tui() -> anyhow::Result<()> {
                                 cursor = 0;
                                 hist_i = None;
                             }
+                        } else if k.modifiers.contains(KeyModifiers::CONTROL) && (c == 'o' || c == 'O') {
+                            // open rune: viewer on last pdf (never blocks the TUI)
+                            if last_pdf != "no seek yet" {
+                                let pdf = last_pdf.clone();
+                                tokio::spawn(async move {
+                                    let _ = tokio::process::Command::new("xdg-open")
+                                        .arg(&pdf)
+                                        .stdin(std::process::Stdio::null())
+                                        .stdout(std::process::Stdio::null())
+                                        .stderr(std::process::Stdio::null())
+                                        .spawn();
+                                });
+                                log.push(format!("opened {last_pdf}"));
+                            } else {
+                                log.push("no PDF yet — seek first".into());
+                            }
                         } else if c == 'p' && seeking.is_none() && view == View::Log && input.is_empty() && last_dir.is_some() {
                             // pixie pass on last seek dir
                             let dir = last_dir.clone().unwrap();
@@ -461,7 +477,7 @@ fn draw(
     let mut chips = if busy {
         "[working…]  [Esc] cancel".to_string()
     } else {
-        "[Enter] seek · [Esc] quit · [↑↓] history · [PgUp/PgDn] scroll · [←→] caret · [Ctrl-U] clear".to_string()
+        "[Enter] seek · [Esc] quit · [↑↓] history · [PgUp/PgDn] scroll · [←→] caret · [Ctrl-U] clear · [Ctrl-O] open pdf".to_string()
     };
     if !busy && can_process {
         chips.push_str(" · [p] process");
