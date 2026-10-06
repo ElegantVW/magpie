@@ -19,6 +19,8 @@ struct Entry {
     specs: Vec<[String; 2]>,
     /// verbatim spans (≤90 chars) for the bibliography
     quotes: Vec<String>,
+    /// outline chapter this entry was filed into
+    section: String,
     /// corroboration: how many dup pages repeat this keeper
     claimed_by: usize,
 }
@@ -89,11 +91,12 @@ async fn chat_once(client: &reqwest::Client, url: &str, body: &serde_json::Value
         .map_err(|e| format!("body:{e}"))
 }
 
-async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, base: &str, title: &str, text: &str) -> (String, Vec<String>, Vec<[String; 2]>, Vec<String>, String) {
+async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, chapters: &[String], base: &str, title: &str, text: &str) -> (String, Vec<String>, Vec<[String; 2]>, Vec<String>, String, String) {
     let excerpt: String = text.chars().take(800).collect();
-    let sys = "You file web pages into a knowledge manual. Reply with ONLY a single JSON object, no other text. Quotes must be copied EXACTLY from the text, at most 90 characters each. Kinds: spec/fault/review/dimensions for vehicles and machines; facts/howto/reference/history for everything else; other as last resort.";
+    let chlist = chapters.join(" | ");
+    let sys = format!("You file web pages into a knowledge manual. Reply with ONLY a single JSON object, no other text. Quotes must be copied EXACTLY from the text, at most 90 characters each. Score relevance 0 for same-name-different-thing pages (a band, a surname, a music mode sharing the query word). File each page into exactly one chapter: {chlist}.");
     let user = format!(
-        "{{\"task\": \"classify\", \"title\": \"{title}\", \"url\": \"{base}\", \"text\": \"{excerpt}\", \"want\": {{\"kind\": \"spec|fault|review|dimensions|facts|howto|reference|history|other\", \"bullets\": [\"up to 3 facts\"], \"specs\": [[\"key\", \"value\"]], \"quotes\": [\"up to 3 verbatim spans\"]}}}}"
+        "{{\"task\": \"classify\", \"title\": \"{title}\", \"url\": \"{base}\", \"text\": \"{excerpt}\", \"want\": {{\"kind\": \"spec|fault|review|dimensions|facts|howto|reference|history|other\", \"section\": \"one of: {chlist}\", \"bullets\": [\"up to 3 facts\"], \"specs\": [[\"key\", \"value\"]], \"quotes\": [\"up to 3 verbatim spans\"]}}}}"
     );
     let body = serde_json::json!({
         "messages": [{"role": "system", "content": sys}, {"role": "user", "content": user}],
@@ -112,9 +115,10 @@ async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, ba
                         "relevance": {"type": "integer", "minimum": 0, "maximum": 100},
                         "bullets": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
                         "specs": {"type": "array", "items": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 2}, "maxItems": 6},
-                        "quotes": {"type": "array", "items": {"type": "string"}, "maxItems": 3}
+                        "quotes": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
+                        "section": {"type": "string"}
                     },
-                    "required": ["kind", "bullets", "specs", "quotes", "relevance"]
+                    "required": ["kind", "bullets", "specs", "quotes", "relevance", "section"]
                 }
             }
         }],
@@ -136,7 +140,10 @@ async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, ba
     }
     let txt = match attempt {
         Ok(t) => t,
-        Err(e) => return with_via(heuristic(title, &excerpt), vec![], &format!("heuristic:{e}").chars().take(48).collect::<String>()),
+        Err(e) => {
+            let sec = chapters.last().cloned().unwrap_or_else(|| "Other".into());
+            return with_via(heuristic(title, &excerpt), vec![], sec, &format!("heuristic:{e}").chars().take(48).collect::<String>());
+        }
     };
     // tool contract first: choices[0].message.tool_calls[0].function.arguments
     // (real function call, not prose). This server build may instead emit
@@ -166,7 +173,7 @@ async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, ba
                 Some(v)
             }
         });
-    let parsed: Option<(String, Vec<String>, Vec<[String; 2]>, Vec<String>, bool, i64)> = (|| {
+    let parsed: Option<(String, Vec<String>, Vec<[String; 2]>, Vec<String>, String, bool, i64)> = (|| {
         // prefer the tool call; then the envelope; fall back to raw content JSON
         let (v, tooled): (serde_json::Value, bool) = match tool_args {
             Some(t) => (t, true),
@@ -215,24 +222,32 @@ async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, ba
                     .collect()
             })
             .unwrap_or_default();
+        // chapter assignment, validated against the outline; unknown falls
+        // back to the last chapter (always the misc bucket)
+        let raw_sec = v.get("section").and_then(|s| s.as_str()).unwrap_or("").to_string();
+        let section = chapters
+            .iter()
+            .find(|c| c.to_lowercase() == raw_sec.to_lowercase())
+            .cloned()
+            .unwrap_or_else(|| chapters.last().cloned().unwrap_or_else(|| "Other".into()));
         if bullets.is_empty() && specs.is_empty() && quotes.is_empty() {
             return None;
         }
-        Some((kind, bullets, specs, quotes, tooled, relevance))
+        Some((kind, bullets, specs, quotes, section, tooled, relevance))
     })();
     match parsed {
-        Some((k, b, s, q, true, r)) if r >= 40 => (k, b, s, q, format!("{via_tag}:tool")),
-        Some((k, b, s, q, false, r)) if r >= 40 => (k, b, s, q, format!("{via_tag}:json")),
-        Some(_) => return with_via(heuristic(title, &excerpt), vec![], "heuristic:irrelevant"),
+        Some((k, b, s, q, sec, true, r)) if r >= 40 => (k, b, s, q, sec, format!("{via_tag}:tool")),
+        Some((k, b, s, q, sec, false, r)) if r >= 40 => (k, b, s, q, sec, format!("{via_tag}:json")),
+        Some(_) => return with_via(heuristic(title, &excerpt), vec![], chapters.last().cloned().unwrap_or_else(|| "Other".into()), "heuristic:irrelevant"),
         None => {
             let (k, b, s) = heuristic(title, &excerpt);
-            (k, b, s, vec![], "heuristic:parse".into())
+            (k, b, s, vec![], chapters.last().cloned().unwrap_or_else(|| "Other".into()), "heuristic:parse".into())
         }
     }
 }
 
-fn with_via(h: (String, Vec<String>, Vec<[String; 2]>), quotes: Vec<String>, via: &str) -> (String, Vec<String>, Vec<[String; 2]>, Vec<String>, String) {
-    (h.0, h.1, h.2, quotes, via.into())
+fn with_via(h: (String, Vec<String>, Vec<[String; 2]>), quotes: Vec<String>, section: String, via: &str) -> (String, Vec<String>, Vec<[String; 2]>, Vec<String>, String, String) {
+    (h.0, h.1, h.2, quotes, section, via.into())
 }
 
 fn heuristic(title: &str, text: &str) -> (String, Vec<String>, Vec<[String; 2]>) {
@@ -285,6 +300,20 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
     let query = v.get("query").and_then(|q| q.as_str()).unwrap_or("seek").to_string();
     let arr = v.get("pages").and_then(|p| p.as_array()).cloned().unwrap_or_default();
     let total = arr.len();
+    // producer outline: subject domain from the wikidata synthetic page,
+    // chapters from the domain table. The manual renders chapters in order
+    // with explicit gap flags where coverage failed.
+    let instance: String = arr
+        .iter()
+        .find(|p| p.get("url").and_then(|u| u.as_str()).map(|u| u.contains("wikidata.org")).unwrap_or(false))
+        .and_then(|p| p.get("text").and_then(|t| t.as_str()))
+        .unwrap_or("")
+        .lines()
+        .find_map(|l| l.strip_prefix("instance of:"))
+        .unwrap_or("")
+        .to_string();
+    let domain = crate::crawl::subject_domain(&query, &instance);
+    let chapters = crate::crawl::chapters(&domain);
     // route inference through menagerie (house control plane): ensure the
     // magpie slot, resolve its URL. No raw-port assumptions.
     let app = llm_app();
@@ -313,7 +342,7 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
         if let Some(tx) = &prog {
             let _ = tx.send(format!("pixie {}/{} {}", entries.len() + 1, total, url.chars().take(50).collect::<String>()));
         }
-        let (kind, bullets, specs, quotes, via) = process_one(&client, &endpoint, &via_tag, &url, &title, &text).await;
+        let (kind, bullets, specs, quotes, section, via) = process_one(&client, &endpoint, &via_tag, &chapters, &url, &title, &text).await;
         // relevance gate: model-scored <40 never reaches the manual
         if via == "heuristic:irrelevant" {
             if let Some(tx) = &prog {
@@ -323,7 +352,7 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
             dropped_irrelevant += 1;
             continue;
         }
-        entries.push(Entry { url, title, kind, via, bullets, specs, quotes, claimed_by: 0 });
+        entries.push(Entry { url, title, kind, via, bullets, specs, quotes, section, claimed_by: 0 });
     }
     // second pass: attribute dups to their keepers (entries index space)
     for p in arr.iter() {
@@ -337,6 +366,8 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
     let out = serde_json::json!({
         "query": query,
         "title": format!("{query} — manual"),
+        "domain": domain,
+        "chapters": chapters,
         "entries": entries,
         "dropped_irrelevant": dropped_irrelevant,
     });
@@ -353,6 +384,7 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
             url: e.url.clone(),
             via: e.via.clone(),
             claimed_by: e.claimed_by,
+            section: e.section.clone(),
             quotes: e.quotes.clone(),
             bullets: e.bullets.clone(),
             specs: e.specs.clone(),
@@ -364,7 +396,7 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
         h.dedup();
         h
     };
-    crate::pdf::render_manual(&query, &mentries, &hosts, &dir.join("manual.pdf"))?;
+    crate::pdf::render_manual(&query, &chapters, &mentries, &hosts, &dir.join("manual.pdf"))?;
     if let Some(tx) = &prog {
         let _ = tx.send("done".into());
     }

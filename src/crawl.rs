@@ -241,6 +241,65 @@ fn alias_queries(query: &str) -> Vec<String> {
     out
 }
 
+/// Producer outline, step 1 — subject domain from the query + the
+/// wikidata instance line. Deterministic and offline-first; no LLM needed.
+pub fn subject_domain(query: &str, instance_of: &str) -> String {
+    let lq = query.to_lowercase();
+    let inst = instance_of.to_lowercase();
+    // vehicle-machine: engine codes, units, years with model tokens
+    let tokens: Vec<&str> = lq
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let techy = tokens.iter().any(|t| {
+        t.chars().any(|c| c.is_ascii_digit()) && t.len() <= 6
+            || ["tdci", "cdti", "hdi", "jtd", "tdi", "ps", "hp", "kw", "cc", "4x4", "awd", "fwd", "v6", "v8"].contains(t)
+    });
+    for place in ["country", "sovereign state", "city", "island", "capital", "region", "province", "municipality", "district"] {
+        if inst.contains(place) {
+            return "place".into();
+        }
+    }
+    if techy {
+        return "vehicle".into();
+    }
+    for v in ["car model", "automobile", "motor vehicle", "aircraft", "ship ", "locomotive", "engine"] {
+        if inst.contains(v) {
+            return "vehicle".into();
+        }
+    }
+    if inst.is_empty() {
+        return "other".into();
+    }
+    "field".into()
+}
+
+/// Producer outline, step 2 — chapters per domain. The manual renders
+/// these in order with explicit gap flags where coverage failed.
+pub fn chapters(domain: &str) -> Vec<String> {
+    match domain {
+        "place" => ["History", "Geography", "Cities & regions", "Cuisine & wine", "Music & arts", "Economy"]
+            .iter().map(|s| s.to_string()).collect(),
+        "vehicle" => ["Specifications", "Faults & reliability", "Reviews & driving", "Dimensions & practicality"]
+            .iter().map(|s| s.to_string()).collect(),
+        "field" => ["Canon & books", "Techniques", "History", "Key figures"]
+            .iter().map(|s| s.to_string()).collect(),
+        _ => ["Facts", "Reference"].iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+/// Chapter queries fanned out as real searches (replaces the fixed
+/// specs/problems pair with domain-aware coverage).
+pub fn chapter_queries(query: &str, domain: &str) -> Vec<String> {
+    let parts: Vec<&str> = match domain {
+        "place" => vec!["history", "cuisine food", "music culture", "geography cities"],
+        "vehicle" => vec!["specifications", "problems faults", "review"],
+        "field" => vec!["techniques", "books canon", "history"],
+        _ => vec!["specifications", "problems"],
+    };
+    parts.iter().map(|c| format!("{query} {c}")).collect()
+}
+
 /// Internet Archive books: public-domain/open full text only.
 /// advancedsearch → metadata (confirm `_djvu.txt` exists) → download.
 /// Lending-library and restricted items never qualify — listed, never fetched.
@@ -290,6 +349,18 @@ async fn ia_books(query: &str, prog: &Option<tokio::sync::mpsc::UnboundedSender<
         // trim front-matter boilerplate, keep the body
         let text = body.chars().take(12000).collect::<String>();
         if text.chars().count() < 2000 {
+            continue;
+        }
+        // content-density gate: the book must actually be ABOUT the query
+        // (title matches lie — cf. poetry volumes). Count query-token hits.
+        let lt = text.to_lowercase();
+        let hits: usize = query
+            .to_lowercase()
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|t| t.len() > 2)
+            .map(|t| lt.matches(t).count())
+            .sum();
+        if hits < 4 {
             continue;
         }
         let chars = text.chars().count();
@@ -546,7 +617,7 @@ fn wikipedia_api(query: &str) -> String {
 /// One synthetic Page, always reachable, no key. Tries progressively
 /// shorter queries ("opel corsa 1.3 cdti" → "opel corsa") since entity
 /// search needs coarse terms.
-async fn wiki_data(query: &str) -> Option<Page> {
+async fn wiki_data(query: &str) -> Option<(Page, String)> {
     let words: Vec<&str> = query.split_whitespace().collect();
     let mut tries = vec![query.to_string()];
     if words.len() > 3 {
@@ -563,7 +634,7 @@ async fn wiki_data(query: &str) -> Option<Page> {
     None
 }
 
-async fn wiki_entity(query: &str) -> Option<Page> {
+async fn wiki_entity(query: &str) -> Option<(Page, String)> {
     let c = client();
     let search = format!(
         "https://www.wikidata.org/w/api.php?action=wbsearchentities&search={}&language=en&format=json&limit=3",
@@ -605,47 +676,93 @@ async fn wiki_entity(query: &str) -> Option<Page> {
     let mut labels: std::collections::HashMap<String, String> = Default::default();
     if !need.is_empty() {
         let ids = need.join("|");
-        if let Ok(t) = c
-            .get(&format!("https://www.wikidata.org/w/api.php?action=wbgetentities&ids={ids}&props=labels&languages=en&format=json"))
-            .send()
-            .await
-        {
-            if let Ok(t) = t.text().await {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) {
-                    if let Some(ents) = v.get("entities").and_then(|e| e.as_object()) {
-                        for (k, ent) in ents {
-                            if let Some(l) = ent.get("labels").and_then(|l| l.get("en")).and_then(|l| l.get("value")).and_then(|x| x.as_str()) {
-                                labels.insert(k.clone(), l.to_string());
+        // one retry: this call flaked silently before, starving both the
+        // text and the instance line of labels
+        for _ in 0..2 {
+            if let Ok(t) = c
+                .get(&format!("https://www.wikidata.org/w/api.php?action=wbgetentities&ids={ids}&props=labels&languages=en&format=json"))
+                .send()
+                .await
+            {
+                if let Ok(t) = t.text().await {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) {
+                        if let Some(ents) = v.get("entities").and_then(|e| e.as_object()) {
+                            for (k, ent) in ents {
+                                if let Some(l) = ent.get("labels").and_then(|l| l.get("en")).and_then(|l| l.get("value")).and_then(|x| x.as_str()) {
+                                    labels.insert(k.clone(), l.to_string());
+                                }
                             }
                         }
                     }
                 }
             }
+            if !labels.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     }
-    let prop_name = |p: &str| -> String {
-        match p {
-            "P31" => "instance of",
-            "P176" => "manufacturer",
-            "P571" => "inception",
-            "P580" => "start time",
-            "P582" => "end time",
-            "P1128" => "employees",
-            "P2139" => "total revenue",
-            "P856" => "official website",
-            _ => return p.to_string(),
+    // curated property map; opaque identifier props are dropped silently
+    // (a human manual never shows Freebase IDs or catalog numbers)
+    let prop_name = |p: &str| -> Option<String> {
+        Some(
+            match p {
+                "P31" => "instance of",
+                "P176" => "manufacturer",
+                "P571" => "inception",
+                "P580" => "start time",
+                "P582" => "end time",
+                "P856" => "official website",
+                "P1082" => "population",
+                "P2046" => "area",
+                "P37" => "official language",
+                "P36" => "capital",
+                "P38" => "currency",
+                "P30" => "continent",
+                "P35" => "head of state",
+                "P6" => "head of government",
+                "P297" => "ISO code",
+                "P463" => "member of",
+                "P17" => "country",
+                "P495" => "country of origin",
+                "P112" => "founded by",
+                _ => return None,
+            }
+            .to_string(),
+        )
+    };
+    // static QID floor: domain-critical entities resolve even when the
+    // labels call flakes (offline-proof; never print raw QIDs to humans)
+    let qid_floor = |q: &str| -> Option<String> {
+        match q {
+            "Q6256" => Some("country".into()),
+            "Q3624078" => Some("sovereign state".into()),
+            "Q515" => Some("city".into()),
+            _ => None,
         }
-        .to_string()
     };
     let mut lines = vec![format!("{label} ({desc}) [Wikidata {id}]")];
-    for (prop, stmts) in claims.iter().take(18) {
+    // curated properties first (instance-of feeds domain detection),
+    // then anything else mapped; opaque IDs never print
+    let mut ordered: Vec<(&String, &serde_json::Value)> = vec![];
+    for (prop, stmts) in claims.iter() {
+        if prop_name(prop).is_some() {
+            // P31 (instance of) always leads — downstream domain detection
+            if prop == "P31" {
+                ordered.insert(0, (prop, stmts));
+            } else {
+                ordered.push((prop, stmts));
+            }
+        }
+    }
+    for (prop, stmts) in ordered.iter().take(18) {
         let mut vals = vec![];
         for st in stmts.as_array().cloned().unwrap_or_default().iter().take(3) {
             let dv = st.get("mainsnak").and_then(|m| m.get("datavalue"));
             let s = match dv.and_then(|d| d.get("type").and_then(|t| t.as_str())) {
                 Some("wikibase-entityid") => dv
                     .and_then(|d| d.get("value")).and_then(|x| x.get("id")).and_then(|x| x.as_str())
-                    .map(|q| labels.get(q).cloned().unwrap_or_else(|| q.to_string()))
+                    .and_then(|q| labels.get(q).cloned().or_else(|| qid_floor(q)))
                     .unwrap_or_default(),
                 Some("time") => dv.and_then(|d| d.get("value")).and_then(|x| x.get("time")).and_then(|x| x.as_str()).unwrap_or("").trim_start_matches('+').split('T').next().unwrap_or("").to_string(),
                 Some("quantity") => dv.and_then(|d| d.get("value")).and_then(|x| x.get("amount")).and_then(|x| x.as_str()).unwrap_or("").to_string(),
@@ -657,7 +774,9 @@ async fn wiki_entity(query: &str) -> Option<Page> {
             }
         }
         if !vals.is_empty() {
-            lines.push(format!("{}: {}", prop_name(prop), vals.join(", ")));
+            if let Some(name) = prop_name(prop) {
+                lines.push(format!("{name}: {}", vals.join(", ")));
+            }
         }
     }
     let text = lines.join("\n");
@@ -665,7 +784,24 @@ async fn wiki_entity(query: &str) -> Option<Page> {
         return None;
     }
     let chars = text.chars().count();
-    Some(Page { url: format!("https://www.wikidata.org/wiki/{id}"), title: format!("{label} — Wikidata"), text: text.clone(), chars, dup_of: None })
+    // instance-of text feeds subject-domain detection downstream
+    let instance = claims
+        .get("P31")
+        .and_then(|s| s.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|st| {
+                    st.get("mainsnak")?.get("datavalue")?.get("value")?.get("id")?.as_str()
+                        .and_then(|q| labels.get(q).cloned().or_else(|| qid_floor(q)))
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    Some((
+        Page { url: format!("https://www.wikidata.org/wiki/{id}"), title: format!("{label} — Wikidata"), text: text.clone(), chars, dup_of: None },
+        instance,
+    ))
 }
 
 /// Sitemap enumeration: /sitemap.xml (+ index children), keep locs
@@ -998,6 +1134,11 @@ pub async fn plan_urls(
             if spam_url(&u) {
                 continue;
             }
+            // verticals are pre-scoped by site: but engines may ignore the
+            // operator — still gate on the model token
+            if !model_gate(query, &u) {
+                continue;
+            }
             if !seen.insert(canon_url(&u)) {
                 continue;
             }
@@ -1031,12 +1172,21 @@ pub async fn plan_urls(
             }
             prefetched.push(p);
         }
-        send("search: openlibrary…");
-        for p in openlibrary(query).await {
-            if spam_url(&p.url) || !seen.insert(canon_url(&p.url)) {
-                continue;
+        // Open Library is bibliography, not knowledge: only worth a slot
+        // when real books were actually found above
+        let found_books = prefetched
+            .iter()
+            .filter(|p| p.url.contains("archive.org") || p.url.contains("wikisource.org"))
+            .count();
+        if found_books > 0 {
+            send("search: openlibrary…");
+            for p in openlibrary(query).await {
+                if spam_url(&p.url) || !seen.insert(canon_url(&p.url)) {
+                    continue;
+                }
+                prefetched.push(p);
+                break;
             }
-            prefetched.push(p);
         }
     }
     // entity traversal: top wikidata entities seed their articles
@@ -1103,15 +1253,20 @@ pub async fn plan_urls(
     }
     // structured facts need no crawl: synthetic page straight into prefetch.
     // Always fetched (cheap, reliable) — not gated on engine results.
+    // The instance line also drives subject-domain detection for chapters.
     send("search: wikidata…");
-    if let Some(p) = wiki_data(query).await {
+    let mut instance_of = String::new();
+    if let Some((p, inst)) = wiki_data(query).await {
         if !spam_url(&p.url) && seen.insert(canon_url(&p.url)) {
+            instance_of = inst;
             prefetched.push(p);
             send("search: wikidata got 1");
         }
     }
+    let domain = subject_domain(query, &instance_of);
+    send(&format!("outline: subject is {domain}"));
     if depth != "quick" && urls.len() < max_pages + 4 {
-        let mut variants = vec![format!("{query} specifications"), format!("{query} problems")];
+        let mut variants = chapter_queries(query, &domain);
         for a in alias_queries(query) {
             variants.push(a);
         }
@@ -1144,6 +1299,17 @@ pub async fn plan_urls(
             }
         }
     }
+    // global encyclopedia cap: exempt legs (family, sitelinks, harvest)
+    // can otherwise flood single-token queries with surnames and bands
+    let wiki_cap = (max_pages * 4 / 10).max(2);
+    let mut wiki_kept = 0;
+    urls.retain(|u| {
+        if u.contains("wikipedia.org") {
+            wiki_kept += 1;
+            return wiki_kept <= wiki_cap;
+        }
+        true
+    });
     urls.truncate(max_pages);
     CrawlPlan { urls, prefetched }
 }

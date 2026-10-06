@@ -46,6 +46,7 @@ pub struct ManualEntry {
     pub url: String,
     pub via: String,
     pub claimed_by: usize,
+    pub section: String,
     pub quotes: Vec<String>,
     pub bullets: Vec<String>,
     pub specs: Vec<[String; 2]>,
@@ -120,37 +121,23 @@ fn callout(doc: &mut Vec<Line>, label: &str, text: &str) {
     doc.push(Line { text: "+".to_string() + &"-".repeat(93) + "+", size: 8.0, bold: true, units: 1 });
 }
 
-/// Structured manual: cover + TOC + grouped sections + sources.
-/// Groups follow the Corsa-manual order: spec, fault, review, dimensions, other.
-pub fn render_manual(query: &str, entries: &[ManualEntry], hosts: &[String], out: &std::path::Path) -> Result<()> {
-    let order = ["spec", "fault", "review", "dimensions", "facts", "howto", "reference", "history", "other"];
-    let titles = [
-        "Specifications",
-        "Faults & reliability",
-        "Reviews & driving",
-        "Dimensions & practicality",
-        "Facts",
-        "How-to",
-        "Reference",
-        "History",
-        "Other sources",
-    ];
-    let grouped: Vec<(usize, Vec<&ManualEntry>)> = order
-        .iter()
-        .enumerate()
-        .map(|(i, k)| (i, entries.iter().filter(|e| e.kind == *k).collect()))
-        .collect();
-
+/// Structured manual: cover + TOC + outline chapters + sources.
+/// Chapters come from the producer outline (domain table); entries were
+/// filed into them by the pixie pass. Empty chapters render an explicit
+/// gap flag instead of vanishing silently.
+pub fn render_manual(query: &str, chapters: &[String], entries: &[ManualEntry], hosts: &[String], out: &std::path::Path) -> Result<()> {
     // Pass 1: build content lines, record section start line index.
     let mut sec_no = 0usize;
     let mut doc: Vec<Line> = vec![];
     let mut sec_starts: Vec<(String, usize)> = vec![];
-    for (i, group) in grouped.iter() {
+    for ch in chapters {
+        let group: Vec<&ManualEntry> = entries.iter().filter(|e| e.section == *ch).collect();
+        sec_starts.push((ch.clone(), doc.len()));
+        h1(&mut doc, &mut sec_no, ch);
         if group.is_empty() {
+            body(&mut doc, "— gap: no sources filed here —");
             continue;
         }
-        sec_starts.push((titles[*i].to_string(), doc.len()));
-        h1(&mut doc, &mut sec_no, titles[*i]);
         for (n, e) in group.iter().enumerate() {
             h2(&mut doc, &format!("[{}] {}", n + 1, truncate(&e.title, 85)));
             source_line(&mut doc, &e.url);
@@ -168,7 +155,7 @@ pub fn render_manual(query: &str, entries: &[ManualEntry], hosts: &[String], out
                 }
             }
         }
-        if titles[*i].starts_with("Faults") {
+        if ch.starts_with("Faults") {
             callout(&mut doc, "WARNING", "Confirm torques, clearances and fluid specs against workshop data for your VIN before work.");
         }
     }

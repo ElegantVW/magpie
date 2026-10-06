@@ -21,6 +21,7 @@ struct EntryRow {
     url: String,
     via: String,
     claimed_by: usize,
+    section: String,
     bullets: Vec<String>,
     quotes: Vec<String>,
 }
@@ -38,6 +39,7 @@ fn load_entries(dir: &PathBuf) -> Vec<EntryRow> {
                     url: e.get("url").and_then(|k| k.as_str()).unwrap_or("").into(),
                     via: e.get("via").and_then(|k| k.as_str()).unwrap_or("?").into(),
                     claimed_by: e.get("claimed_by").and_then(|k| k.as_u64()).unwrap_or(0) as usize,
+                    section: e.get("section").and_then(|k| k.as_str()).unwrap_or("").into(),
                     bullets: e
                         .get("bullets")
                         .and_then(|b| b.as_array())
@@ -104,7 +106,7 @@ pub async fn run_tui() -> anyhow::Result<()> {
                         if view == View::Entries {
                             // open entry: drop bullets + url into log, back to Log
                             if let Some(e) = entries.get(sel) {
-                                log.push(format!("[{}|{}] {}", e.kind, e.via, e.title));
+                                log.push(format!("[{}|{}] {} — {}", e.kind, e.via, e.section, e.title));
                                 for b in &e.bullets {
                                     log.push(format!("  - {b}"));
                                 }
