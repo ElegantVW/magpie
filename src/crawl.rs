@@ -1270,10 +1270,11 @@ pub async fn plan_urls(
         for a in alias_queries(query) {
             variants.push(a);
         }
+        // per-chapter ring merge: each chapter gets its fair share first,
+        // so one loud chapter can't eat the whole budget (Portugal's
+        // History drowning Cuisine). Collect per variant, then interleave.
+        let mut buckets: Vec<Vec<String>> = vec![];
         for variant in variants {
-            if urls.len() >= max_pages + 4 {
-                break;
-            }
             send(&format!("search: variant {variant}…"));
             let extra = match tokio::time::timeout(std::time::Duration::from_secs(20), ddg_search(&variant, 3)).await {
                 Ok(v) => v,
@@ -1282,6 +1283,7 @@ pub async fn plan_urls(
                     vec![]
                 }
             };
+            let mut bucket = vec![];
             for u in extra {
                 if spam_url(&u) {
                     continue;
@@ -1292,11 +1294,27 @@ pub async fn plan_urls(
                 if !seen.insert(canon_url(&u)) {
                     continue;
                 }
-                urls.push(u);
-                if urls.len() >= max_pages {
+                bucket.push(u);
+                if bucket.len() >= 3 {
                     break;
                 }
             }
+            buckets.push(bucket);
+        }
+        // round-robin: ch1u1, ch2u1, … ch1u2, ch2u2, …
+        let mut round = 0;
+        loop {
+            let mut added = false;
+            for b in buckets.iter() {
+                if round < b.len() && urls.len() < max_pages + 4 {
+                    urls.push(b[round].clone());
+                    added = true;
+                }
+            }
+            if !added {
+                break;
+            }
+            round += 1;
         }
     }
     // global encyclopedia cap: exempt legs (family, sitelinks, harvest)
