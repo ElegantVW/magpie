@@ -114,6 +114,26 @@ fn unwrap_ddg(href: &str) -> String {
 }
 
 async fn ddg_search(query: &str, n: usize) -> Vec<String> {
+    ddg_search_tries(query, n, 3, 20).await
+}
+
+async fn ddg_search_tries(query: &str, n: usize, tries: usize, wait_s: u64) -> Vec<String> {
+    // POST like python magpie: q, kl=us-en, df=, s=0.
+    // Retried with backoff: throttled engines recover if out-waited,
+    // and runtime no longer matters more than coverage.
+    for attempt in 0..tries.max(1) {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(wait_s)).await;
+        }
+        let out = ddg_once(query, n).await;
+        if !out.is_empty() || attempt + 1 >= tries.max(1) {
+            return out;
+        }
+    }
+    vec![]
+}
+
+async fn ddg_once(query: &str, n: usize) -> Vec<String> {
     // POST like python magpie: q, kl=us-en, df=, s=0
     let c = client();
     let params = [("q", query), ("kl", "us-en"), ("df", ""), ("s", "0")];
@@ -171,6 +191,23 @@ fn hex(b: u8) -> Option<u8> {
 }
 
 async fn marginalia_search(query: &str, n: usize) -> Vec<String> {
+    marginalia_tries(query, n, 3, 20).await
+}
+
+async fn marginalia_tries(query: &str, n: usize, tries: usize, wait_s: u64) -> Vec<String> {
+    for attempt in 0..tries.max(1) {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(wait_s)).await;
+        }
+        let out = marginalia_once(query, n).await;
+        if !out.is_empty() || attempt + 1 >= tries.max(1) {
+            return out;
+        }
+    }
+    vec![]
+}
+
+async fn marginalia_once(query: &str, n: usize) -> Vec<String> {
     // old text-friendly UI like python magpie (new UI is JS-only)
     let c = client();
     let url = format!(
@@ -346,8 +383,9 @@ async fn ia_books(query: &str, prog: &Option<tokio::sync::mpsc::UnboundedSender<
             Ok(r) => r.text().await.unwrap_or_default(),
             Err(_) => continue,
         };
-        // trim front-matter boilerplate, keep the body
-        let text = body.chars().take(12000).collect::<String>();
+        // full text, not a sample: books are chunked downstream, and
+        // runtime no longer matters more than coverage (cap ~400KB)
+        let text: String = body.chars().take(400_000).collect();
         if text.chars().count() < 2000 {
             continue;
         }
@@ -419,10 +457,11 @@ async fn wikisource_search(query: &str) -> Vec<Page> {
                 }
             }
         }
-        let text: String = text.chars().take(12000).collect();
+        let text: String = text.chars().take(200_000).collect();
         if text.chars().count() < 500 {
             continue;
         }
+        // Wikisource extracts arrive whole; chunking happens downstream
         let chars = text.chars().count();
         out.push(Page {
             url: format!(
@@ -990,7 +1029,7 @@ async fn site_scoped(query: &str, prog: &Option<tokio::sync::mpsc::UnboundedSend
     let mut out = vec![];
     for host in VERTICALS {
         let q = format!("{query} site:{host}");
-        let mut hits = ddg_search(&q, 2).await;
+        let mut hits = ddg_search_tries(&q, 2, 2, 10).await;
         // keep only hits actually on the vertical (DDG may ignore site:)
         hits.retain(|u| u.to_lowercase().contains(host));
         if !hits.is_empty() {
@@ -1028,8 +1067,8 @@ pub async fn plan_urls(
     };
     let (per_engine, wiki_n) = match depth {
         "quick" => (4, 2),
-        "extreme" => (10, 5),
-        _ => (6, 3),
+        "extreme" => (16, 5),
+        _ => (10, 3),
     };
     let mut urls: Vec<String> = vec![];
     let mut prefetched: Vec<Page> = vec![];
@@ -1276,7 +1315,7 @@ pub async fn plan_urls(
         let mut buckets: Vec<Vec<String>> = vec![];
         for variant in variants {
             send(&format!("search: variant {variant}…"));
-            let extra = match tokio::time::timeout(std::time::Duration::from_secs(20), ddg_search(&variant, 3)).await {
+            let extra = match tokio::time::timeout(std::time::Duration::from_secs(60), ddg_search_tries(&variant, 3, 2, 10)).await {
                 Ok(v) => v,
                 Err(_) => {
                     send("search: variant timed out, continuing…");
@@ -1284,6 +1323,12 @@ pub async fn plan_urls(
                 }
             };
             let mut bucket = vec![];
+            // per-chapter budget grows with depth: quick 3, deep 6, extreme 10
+            let bucket_cap = match depth {
+                "quick" => 3,
+                "extreme" => 10,
+                _ => 6,
+            };
             for u in extra {
                 if spam_url(&u) {
                     continue;
@@ -1295,7 +1340,7 @@ pub async fn plan_urls(
                     continue;
                 }
                 bucket.push(u);
-                if bucket.len() >= 3 {
+                if bucket.len() >= bucket_cap {
                     break;
                 }
             }
@@ -1436,16 +1481,18 @@ fn canon_url(u: &str) -> String {
     let mut path = parsed.path().to_lowercase();
     if path.len() > 4 {
         let b = path.as_bytes();
-        if b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2].is_ascii_alphabetic() && b[3] == b'/' {
+        if b[0] == b'/' && b[1].is_ascii_alphanumeric() && b[2].is_ascii_alphanumeric() && b[3] == b'/' {
             path = path[3..].to_string();
         }
     }
+    // keep #chunk-N fragments: chunks of one book are distinct entries
+    let frag = parsed.fragment().map(|f| format!("#{f}")).unwrap_or_default();
     // cross-TLD collapse only for deep content paths (avoids merging
     // unrelated same-name domains on short index paths)
     if path.len() > 8 {
-        return format!("{site}{path}");
+        return format!("{site}{path}{frag}");
     }
-    format!("{host}{path}")
+    format!("{host}{path}{frag}")
 }
 
 /// Boost: hosts where specs / reliability / dimensions actually live.

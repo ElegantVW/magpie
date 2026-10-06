@@ -22,6 +22,76 @@ fn norm_words(t: &str) -> HashSet<String> {
         .collect()
 }
 
+/// Split texts over 12000 chars into ~6000-char paragraph windows.
+/// First chunk keeps the URL; rest get #chunk-N fragments (canon keeps
+/// fragments, so chunks survive dedupe as distinct entries).
+fn chunk_pages(pages: &mut Vec<Page>) {
+    const LIMIT: usize = 12_000;
+    const WINDOW: usize = 6_000;
+    let mut out: Vec<Page> = Vec::with_capacity(pages.len());
+    for p in pages.drain(..) {
+        if p.chars <= LIMIT {
+            out.push(p);
+            continue;
+        }
+        // paragraph boundaries: blank-line runs, else single newlines
+        let paras: Vec<&str> = p.text.split("\n\n").collect();
+        let mut cur = String::new();
+        let mut cur_n = 0usize;
+        let mut n = 0usize;
+        let mut flush = |cur: &mut String, cur_n: &mut usize, n: &mut usize, out: &mut Vec<Page>, p: &Page| {
+            if cur.trim().is_empty() {
+                return;
+            }
+            let url = if *n == 0 { p.url.clone() } else { format!("{}#chunk-{n}", p.url) };
+            let title = if *n == 0 {
+                p.title.clone()
+            } else {
+                format!("{} (part {})", p.title, *n + 1)
+            };
+            let text = std::mem::take(cur);
+            let chars = text.chars().count();
+            out.push(Page { url, title, text, chars, dup_of: None });
+            *cur_n = 0;
+            *n += 1;
+        };
+        for para in paras {
+            // hard-split pathological single paragraphs (OCR walls)
+            if para.chars().count() > WINDOW {
+                flush(&mut cur, &mut cur_n, &mut n, &mut out, &p);
+                let mut w = String::new();
+                let mut wn = 0usize;
+                for word in para.split_whitespace() {
+                    let l = word.chars().count() + 1;
+                    if wn + l > WINDOW && !w.is_empty() {
+                        flush(&mut w, &mut wn, &mut n, &mut out, &p);
+                    }
+                    if !w.is_empty() {
+                        w.push(' ');
+                        wn += 1;
+                    }
+                    w.push_str(word);
+                    wn += word.chars().count();
+                }
+                cur = w;
+                cur_n = wn;
+                continue;
+            }
+            let l = para.chars().count() + 2;
+            if cur_n + l > WINDOW && !cur.trim().is_empty() {
+                flush(&mut cur, &mut cur_n, &mut n, &mut out, &p);
+            }
+            if !cur.is_empty() {
+                cur.push_str("\n\n");
+            }
+            cur.push_str(para);
+            cur_n += l;
+        }
+        flush(&mut cur, &mut cur_n, &mut n, &mut out, &p);
+    }
+    *pages = out;
+}
+
 /// Near-duplicate pass: flag pages whose normalized word overlap ≥80%
 /// as `dup_of` the longer keeper (locale mirrors, syndication).
 /// Repetition is signal: dups are kept as corroboration, not dropped.
@@ -69,6 +139,13 @@ pub async fn run_seek_with_progress(
     no_pdf: bool,
     prog: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 ) -> Result<std::path::PathBuf> {
+    // depth floors: a manual needs volume. Explicit --pages below the
+    // floor is raised (time no longer matters more than coverage).
+    let pages_n = match depth.as_str() {
+        "quick" => pages_n.max(4),
+        "extreme" => pages_n.max(50),
+        _ => pages_n.max(20),
+    };
     let dir = seek_dir(&query, out);
     std::fs::create_dir_all(&dir).map_err(|e| MagpieError::Io(e.to_string()))?;
 
@@ -105,6 +182,10 @@ pub async fn run_seek_with_progress(
             pages.append(&mut more);
         }
     }
+    // chapter chunking: long texts (books, long articles) split into
+    // ~6000-char paragraph windows, one entry each. This is the density
+    // answer: a 300KB book becomes ~50 entries instead of one lead excerpt.
+    chunk_pages(&mut pages);
     // near-duplicate pass: flag mirrors as dup_of (kept as corroboration)
     let dupes = mark_dupes(&mut pages);
     // rank: spec density + length, drop spam hosts already filtered

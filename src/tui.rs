@@ -43,7 +43,7 @@ fn load_entries(dir: &PathBuf) -> Vec<EntryRow> {
                     bullets: e
                         .get("bullets")
                         .and_then(|b| b.as_array())
-                        .map(|b| b.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).take(3).collect())
+                        .map(|b| b.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).take(10).collect())
                         .unwrap_or_default(),
                     quotes: e
                         .get("quotes")

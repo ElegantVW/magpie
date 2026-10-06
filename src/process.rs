@@ -92,16 +92,16 @@ async fn chat_once(client: &reqwest::Client, url: &str, body: &serde_json::Value
 }
 
 async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, chapters: &[String], base: &str, title: &str, text: &str) -> (String, Vec<String>, Vec<[String; 2]>, Vec<String>, String, String) {
-    let excerpt: String = text.chars().take(800).collect();
+    let excerpt: String = text.chars().take(5000).collect();
     let chlist = chapters.join(" | ");
     let sys = format!("You file web pages into a knowledge manual. Reply with ONLY a single JSON object, no other text. Quotes must be copied EXACTLY from the text, at most 90 characters each. Score relevance 0 for same-name-different-thing pages (a band, a surname, a music mode sharing the query word). File each page into exactly one chapter: {chlist}.");
     let user = format!(
-        "{{\"task\": \"classify\", \"title\": \"{title}\", \"url\": \"{base}\", \"text\": \"{excerpt}\", \"want\": {{\"kind\": \"spec|fault|review|dimensions|facts|howto|reference|history|other\", \"section\": \"one of: {chlist}\", \"bullets\": [\"up to 3 facts\"], \"specs\": [[\"key\", \"value\"]], \"quotes\": [\"up to 3 verbatim spans\"]}}}}"
+        "{{\"task\": \"classify\", \"title\": \"{title}\", \"url\": \"{base}\", \"text\": \"{excerpt}\", \"want\": {{\"kind\": \"spec|fault|review|dimensions|facts|howto|reference|history|other\", \"section\": \"one of: {chlist}\", \"bullets\": [\"up to 10 facts\"], \"specs\": [[\"key\", \"value\"] up to 12], \"quotes\": [\"up to 3 verbatim spans\"]}}}}"
     );
     let body = serde_json::json!({
         "messages": [{"role": "system", "content": sys}, {"role": "user", "content": user}],
         "temperature": 0.1,
-        "max_tokens": 280,
+        "max_tokens": 700,
         "response_format": {"type": "json_object"},
         "tools": [{
             "type": "function",
@@ -113,8 +113,8 @@ async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, ch
                     "properties": {
                         "kind": {"type": "string", "enum": ["spec", "fault", "review", "dimensions", "facts", "howto", "reference", "history", "other"]},
                         "relevance": {"type": "integer", "minimum": 0, "maximum": 100},
-                        "bullets": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
-                        "specs": {"type": "array", "items": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 2}, "maxItems": 6},
+                        "bullets": {"type": "array", "items": {"type": "string"}, "maxItems": 10},
+                        "specs": {"type": "array", "items": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 2}, "maxItems": 12},
                         "quotes": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
                         "section": {"type": "string"}
                     },
@@ -187,7 +187,7 @@ async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, ch
         let bullets: Vec<String> = v
             .get("bullets")
             .and_then(|b| b.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.chars().take(200).collect())).take(3).collect())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.chars().take(200).collect())).take(10).collect())
             .unwrap_or_default();
         let specs: Vec<[String; 2]> = v
             .get("specs")
@@ -205,7 +205,7 @@ async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, ch
                             ])
                         }
                     })
-                    .take(6)
+                    .take(12)
                     .collect()
             })
             .unwrap_or_default();
