@@ -44,9 +44,11 @@ TUI keys: type + `Enter` seek, `p` pixie pass on last result, `e` entry list (`[
 
 ## Thoroughness
 
-* Chain: DDG HTML POST → old-search Marginalia → Wikipedia API → query variants → second-hop outbound links (query-token gated, dealer-lot + share-URL blocklist, locale-mirror + near-duplicate dedupe)
+* Chain: DDG HTML POST → old-search Marginalia → Wikipedia family (en/de/pl/it) → `site:` verticals → sitemaps → Common Crawl WARC → Wikidata structured facts
+* Bulk without search engines: sitemap enumeration + CC index→WARC range fetch (gunzip locally) + Wikidata claims API, all keyless
+* Repetition is signal: near-dups kept as `dup_of` corroboration (`claimed_by ×N`), skipped by the LLM pass to save compute; locale mirrors collapse at URL level
 * Gate: warns on `<4 pages`, `<3 hosts`, wiki-only, missing specs/faults. No PDF-only-from-wikipedia claim.
-* Pixie pass: one `/v1/chat/completions` JSON-enforced task per entry (menagerie-ensured model), each tagged `via: llm|heuristic:*` in entries, entries view, cover and sources.
+* Pixie pass via menagerie (`llm:magpie` slot, GPU-backed): one `/v1/chat/completions` JSON-enforced task per keeper entry, each tagged `via: llm:*|heuristic:*` in entries, entries view, cover and sources.
 * Cache: `~/.cache/magpie/seek/<slug>/seek.json`, `processed.json`, `dump.pdf`/`manual.pdf`
 * PDF is local minimal writer (Helvetica A4), no LLM in layout, no cloud.
 

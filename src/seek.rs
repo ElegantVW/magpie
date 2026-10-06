@@ -83,6 +83,14 @@ pub async fn run_seek_with_progress(
         let _ = tx.send(format!("crawling {} urls…", plan.urls.len()));
     }
     let mut pages = crawl_urls(&plan.urls, prog.clone()).await;
+    // bulk legs already fetched content (WARC, structured APIs): merge in
+    let n_pre = plan.prefetched.len();
+    pages.extend(plan.prefetched);
+    if n_pre > 0 {
+        if let Some(tx) = &prog {
+            let _ = tx.send(format!("bulk: +{n_pre} prefetched pages"));
+        }
+    }
     // second-hop: harvest outbound links for diversity when engines throttle
     if pages.len() < pages_n {
         if let Some(tx) = &prog {

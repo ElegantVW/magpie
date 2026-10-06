@@ -229,6 +229,243 @@ fn wikipedia_api(query: &str) -> String {
     )
 }
 
+/// Wikidata: structured facts via API (search → claims → label resolve).
+/// One synthetic Page, always reachable, no key. Tries progressively
+/// shorter queries ("opel corsa 1.3 cdti" → "opel corsa") since entity
+/// search needs coarse terms.
+async fn wiki_data(query: &str) -> Option<Page> {
+    let words: Vec<&str> = query.split_whitespace().collect();
+    let mut tries = vec![query.to_string()];
+    if words.len() > 3 {
+        tries.push(words[..3].join(" "));
+    }
+    if words.len() > 2 {
+        tries.push(words[..2].join(" "));
+    }
+    for q in tries {
+        if let Some(p) = wiki_entity(&q).await {
+            return Some(p);
+        }
+    }
+    None
+}
+
+async fn wiki_entity(query: &str) -> Option<Page> {
+    let c = client();
+    let search = format!(
+        "https://www.wikidata.org/w/api.php?action=wbsearchentities&search={}&language=en&format=json&limit=3",
+        url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>()
+    );
+    let s = c.get(&search).send().await.ok()?.text().await.ok()?;
+    let id = Regex::new(r#""id":"(Q\d+)""#)
+        .unwrap()
+        .captures_iter(&s)
+        .map(|c| c[1].to_string())
+        .next()?;
+    let ent = c
+        .get(&format!("https://www.wikidata.org/w/api.php?action=wbgetentities&ids={id}&props=labels%7Cdescriptions%7Cclaims&languages=en&format=json"))
+        .send()
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    let v: serde_json::Value = serde_json::from_str(&ent).ok()?;
+    let e = v.get("entities")?.get(&id)?;
+    let label = e.get("labels")?.get("en")?.get("value").and_then(|x| x.as_str()).unwrap_or(&id).to_string();
+    let desc = e.get("descriptions")?.get("en")?.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let claims = e.get("claims")?.as_object()?;
+    // resolve value entity labels in one call
+    let mut need: Vec<String> = vec![];
+    for stmts in claims.values().take(20) {
+        for st in stmts.as_array().cloned().unwrap_or_default().iter().take(3) {
+            if let Some(q) = st.get("mainsnak").and_then(|m| m.get("datavalue")).and_then(|d| d.get("value")).and_then(|x| x.get("id")).and_then(|x| x.as_str()) {
+                if !need.contains(&q.to_string()) {
+                    need.push(q.to_string());
+                }
+            }
+        }
+        if need.len() >= 40 {
+            break;
+        }
+    }
+    let mut labels: std::collections::HashMap<String, String> = Default::default();
+    if !need.is_empty() {
+        let ids = need.join("|");
+        if let Ok(t) = c
+            .get(&format!("https://www.wikidata.org/w/api.php?action=wbgetentities&ids={ids}&props=labels&languages=en&format=json"))
+            .send()
+            .await
+        {
+            if let Ok(t) = t.text().await {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) {
+                    if let Some(ents) = v.get("entities").and_then(|e| e.as_object()) {
+                        for (k, ent) in ents {
+                            if let Some(l) = ent.get("labels").and_then(|l| l.get("en")).and_then(|l| l.get("value")).and_then(|x| x.as_str()) {
+                                labels.insert(k.clone(), l.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let prop_name = |p: &str| -> String {
+        match p {
+            "P31" => "instance of",
+            "P176" => "manufacturer",
+            "P571" => "inception",
+            "P580" => "start time",
+            "P582" => "end time",
+            "P1128" => "employees",
+            "P2139" => "total revenue",
+            "P856" => "official website",
+            _ => return p.to_string(),
+        }
+        .to_string()
+    };
+    let mut lines = vec![format!("{label} ({desc}) [Wikidata {id}]")];
+    for (prop, stmts) in claims.iter().take(18) {
+        let mut vals = vec![];
+        for st in stmts.as_array().cloned().unwrap_or_default().iter().take(3) {
+            let dv = st.get("mainsnak").and_then(|m| m.get("datavalue"));
+            let s = match dv.and_then(|d| d.get("type").and_then(|t| t.as_str())) {
+                Some("wikibase-entityid") => dv
+                    .and_then(|d| d.get("value")).and_then(|x| x.get("id")).and_then(|x| x.as_str())
+                    .map(|q| labels.get(q).cloned().unwrap_or_else(|| q.to_string()))
+                    .unwrap_or_default(),
+                Some("time") => dv.and_then(|d| d.get("value")).and_then(|x| x.get("time")).and_then(|x| x.as_str()).unwrap_or("").trim_start_matches('+').split('T').next().unwrap_or("").to_string(),
+                Some("quantity") => dv.and_then(|d| d.get("value")).and_then(|x| x.get("amount")).and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                Some("string") | Some("url") => dv.and_then(|d| d.get("value")).and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                _ => continue,
+            };
+            if !s.is_empty() {
+                vals.push(s);
+            }
+        }
+        if !vals.is_empty() {
+            lines.push(format!("{}: {}", prop_name(prop), vals.join(", ")));
+        }
+    }
+    let text = lines.join("\n");
+    if text.chars().count() < 80 {
+        return None;
+    }
+    let chars = text.chars().count();
+    Some(Page { url: format!("https://www.wikidata.org/wiki/{id}"), title: format!("{label} — Wikidata"), text: text.clone(), chars, dup_of: None })
+}
+
+/// Sitemap enumeration: /sitemap.xml (+ index children), keep locs
+/// matching query tokens. Zero search-engine dependence.
+async fn sitemap_urls(host: &str, tokens: &[String], limit: usize) -> Vec<String> {
+    let c = client();
+    let root = format!("https://{host}/sitemap.xml");
+    let xml = match c.get(&root).send().await {
+        Ok(r) => r.text().await.unwrap_or_default(),
+        Err(_) => return vec![],
+    };
+    let loc_re = Regex::new(r"<loc>([^<]+)</loc>").unwrap();
+    let mut locs: Vec<String> = loc_re.captures_iter(&xml).map(|c| c[1].to_string()).collect();
+    // sitemapindex: recurse into children (cap 4)
+    if xml.contains("sitemapindex") {
+        let mut deep = vec![];
+        for child in locs.iter().take(4) {
+            if let Ok(r) = c.get(child).send().await {
+                if let Ok(t) = r.text().await {
+                    deep.extend(loc_re.captures_iter(&t).map(|c| c[1].to_string()));
+                }
+            }
+        }
+        locs = deep;
+    }
+    locs.into_iter()
+        .filter(|u| {
+            let lu = u.to_lowercase();
+            (lu.ends_with(".html") || lu.ends_with(".htm") || lu.ends_with('/') || !lu.split('/').last().unwrap_or("").contains('.'))
+                && tokens.iter().any(|t| lu.contains(t.as_str()))
+        })
+        .take(limit)
+        .collect()
+}
+
+/// Common Crawl: index API → WARC byte-range fetch → gunzip → extract.
+/// Bulk web without search engines. `prefix` like "ultimatespecs.com/car-specs/Opel/".
+async fn common_crawl(prefix: &str, tokens: &[String], limit: usize) -> Vec<Page> {
+    let c = client();
+    let idx = format!(
+        "https://index.commoncrawl.org/CC-MAIN-2025-30-index?url={}%2F*&output=json&filter=status%3A200&limit=40",
+        prefix.trim_end_matches('/')
+    );
+    let list = match c.get(&idx).send().await {
+        Ok(r) => r.text().await.unwrap_or_default(),
+        Err(_) => return vec![],
+    };
+    let mut out = vec![];
+    for line in list.lines() {
+        if out.len() >= limit {
+            break;
+        }
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let url = v.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string();
+        let lu = url.to_lowercase();
+        if !tokens.iter().any(|t| lu.contains(t.as_str())) {
+            continue;
+        }
+        let (filename, offset, length) = match (
+            v.get("filename").and_then(|x| x.as_str()),
+            v.get("offset").and_then(|x| x.as_str()),
+            v.get("length").and_then(|x| x.as_str()),
+        ) {
+            (Some(f), Some(o), Some(l)) => (f.to_string(), o.to_string(), l.to_string()),
+            _ => continue,
+        };
+        let (offset, length): (usize, usize) = match (offset.parse(), length.parse()) {
+            (Ok(o), Ok(l)) => (o, l),
+            _ => continue,
+        };
+        if length == 0 || length > 4_000_000 {
+            continue;
+        }
+        let warc_url = format!("https://data.commoncrawl.org/{filename}");
+        let bytes = match c
+            .get(&warc_url)
+            .header("Range", format!("bytes={}-{}", offset, offset + length - 1))
+            .send()
+            .await
+        {
+            Ok(r) => r.bytes().await.unwrap_or_default(),
+            Err(_) => continue,
+        };
+        // CC records are standalone gzip members: decompress, skip WARC + HTTP headers
+        let mut dec = flate2::read::GzDecoder::new(&bytes[..]);
+        let mut raw = Vec::new();
+        use std::io::Read;
+        if dec.read_to_end(&mut raw).is_err() {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&raw);
+        let parts: Vec<&str> = text.split("\r\n\r\n").collect();
+        let html = parts.last().unwrap_or(&"");
+        if html.len() < 1000 {
+            continue;
+        }
+        let (mut title, body) = extract_text(html);
+        if body.chars().count() < 200 {
+            continue;
+        }
+        if title.is_empty() {
+            title = url.clone();
+        }
+        let chars = body.chars().count();
+        out.push(Page { url, title, text: body, chars, dup_of: None });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+    out
+}
+
 /// Wikipedia family: en/de/pl/it opensearch (proven car-spec value:
 ///
 /// German datasheets, Polish Multijet pages). Always reachable.
@@ -287,6 +524,9 @@ async fn site_scoped(query: &str, prog: &Option<tokio::sync::mpsc::UnboundedSend
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CrawlPlan {
     pub urls: Vec<String>,
+    /// content already fetched from bulk legs (WARC, structured APIs)
+    #[serde(default)]
+    pub prefetched: Vec<Page>,
 }
 
 /// Build thorough URL list: DDG + Marginalia + Wikipedia titles.
@@ -307,6 +547,7 @@ pub async fn plan_urls(
         _ => (6, 3),
     };
     let mut urls: Vec<String> = vec![];
+    let mut prefetched: Vec<Page> = vec![];
     let mut seen = HashSet::new();
 
     send("search: duckduckgo…");
@@ -399,6 +640,63 @@ pub async fn plan_urls(
             }
         }
     }
+    // bulk legs: sitemaps + Common Crawl on hosts already seen (no search engine)
+    if urls.len() < max_pages {
+        use std::collections::HashSet as _Hs2;
+        let mut hosts: Vec<String> = vec![];
+        let mut _hs = _Hs2::new();
+        for u in urls.iter() {
+            if let Ok(p) = url::Url::parse(u) {
+                let h = p.host_str().unwrap_or("").to_string();
+                if !h.is_empty() && !h.contains("wikipedia.org") && _hs.insert(h.clone()) {
+                    hosts.push(h);
+                }
+            }
+            if hosts.len() >= 4 {
+                break;
+            }
+        }
+        let tokens: Vec<String> = query
+            .to_lowercase()
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|t| t.len() > 2)
+            .map(|t| t.to_string())
+            .collect();
+        for h in hosts.iter().take(3) {
+            if urls.len() >= max_pages {
+                break;
+            }
+            send(&format!("search: sitemap {h}…"));
+            for u in sitemap_urls(h, &tokens, 3).await {
+                if spam_url(&u) || !seen.insert(canon_url(&u)) {
+                    continue;
+                }
+                urls.push(u);
+                if urls.len() >= max_pages {
+                    break;
+                }
+            }
+        }
+        send("search: commoncrawl…");
+        for h in hosts.iter().take(2) {
+            let prefix = h.trim_start_matches("www.").to_string() + "/";
+            for p in common_crawl(&prefix, &tokens, 2).await {
+                if spam_url(&p.url) || !seen.insert(canon_url(&p.url)) {
+                    continue;
+                }
+                prefetched.push(p);
+            }
+        }
+    }
+    // structured facts need no crawl: synthetic page straight into prefetch.
+    // Always fetched (cheap, reliable) — not gated on engine results.
+    send("search: wikidata…");
+    if let Some(p) = wiki_data(query).await {
+        if !spam_url(&p.url) && seen.insert(canon_url(&p.url)) {
+            prefetched.push(p);
+            send("search: wikidata got 1");
+        }
+    }
     if depth != "quick" && urls.len() < max_pages {
         for variant in [format!("{query} specifications"), format!("{query} problems")] {
             send(&format!("search: variant {variant}…"));
@@ -424,7 +722,7 @@ pub async fn plan_urls(
         }
     }
     urls.truncate(max_pages);
-    CrawlPlan { urls }
+    CrawlPlan { urls, prefetched }
 }
 
 pub async fn crawl_urls(urls: &[String], prog: Option<tokio::sync::mpsc::UnboundedSender<String>>) -> Vec<Page> {

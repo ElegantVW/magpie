@@ -23,6 +23,7 @@ regex = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 html-escape = "0.2"
 anyhow = "1"
+flate2 = "1"
 
 [dev-dependencies]
 tempfile = "3"
