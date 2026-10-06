@@ -45,6 +45,7 @@ pub struct ManualEntry {
     pub title: String,
     pub url: String,
     pub via: String,
+    pub claimed_by: usize,
     pub bullets: Vec<String>,
     pub specs: Vec<[String; 2]>,
 }
@@ -148,7 +149,8 @@ pub fn render_manual(query: &str, entries: &[ManualEntry], hosts: &[String], out
     sec_starts.push(("Sources".into(), doc.len()));
     h1(&mut doc, &mut sec_no, "Sources");
     for (n, e) in entries.iter().enumerate() {
-        body(&mut doc, &format!("{}. [{}|{}] {} — {}", n + 1, e.kind, e.via, truncate(&e.title, 60), e.url));
+        let cor = if e.claimed_by > 0 { format!(" ×{}", e.claimed_by + 1) } else { String::new() };
+        body(&mut doc, &format!("{}. [{}|{}]{cor} {} — {}", n + 1, e.kind, e.via, truncate(&e.title, 60), e.url));
     }
 
     // Pass 2: paginate content (50 units/page), map sections to pages.

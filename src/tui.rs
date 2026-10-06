@@ -20,6 +20,7 @@ struct EntryRow {
     title: String,
     url: String,
     via: String,
+    claimed_by: usize,
     bullets: Vec<String>,
 }
 
@@ -35,6 +36,7 @@ fn load_entries(dir: &PathBuf) -> Vec<EntryRow> {
                     title: e.get("title").and_then(|k| k.as_str()).unwrap_or("").into(),
                     url: e.get("url").and_then(|k| k.as_str()).unwrap_or("").into(),
                     via: e.get("via").and_then(|k| k.as_str()).unwrap_or("?").into(),
+                    claimed_by: e.get("claimed_by").and_then(|k| k.as_u64()).unwrap_or(0) as usize,
                     bullets: e
                         .get("bullets")
                         .and_then(|b| b.as_array())
@@ -405,7 +407,8 @@ fn draw(
         let _ = off;
         for (i, e) in entries.iter().enumerate().skip(start).take(end - start) {
             let mark = if i == sel { "►" } else { "·" };
-            rows_v.push(format!("{mark} [{}|{}] {}", e.kind, e.via, safe_head(&e.title, 72)));
+            let cor = if e.claimed_by > 0 { format!(" ×{}", e.claimed_by + 1) } else { String::new() };
+            rows_v.push(format!("{mark} [{}|{}]{cor} {}", e.kind, e.via, safe_head(&e.title, 68)));
         }
         while rows_v.len() > max_rows {
             rows_v.remove(0);

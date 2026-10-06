@@ -17,10 +17,54 @@ struct Entry {
     via: String,
     bullets: Vec<String>,
     specs: Vec<[String; 2]>,
+    /// corroboration: how many dup pages repeat this keeper
+    claimed_by: usize,
 }
 
-fn llm_url() -> String {
-    std::env::var("PIXIE_LLM_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into())
+fn llm_app() -> String {
+    std::env::var("MAGPIE_LLM_APP").unwrap_or_else(|_| "magpie".into())
+}
+
+/// Resolve the inference endpoint through menagerie (the house control
+/// plane): ensure the app slot, then read its URL. Falls back to
+/// PIXIE_LLM_URL, then pixie's :8080. Returns (url, via_tag).
+async fn llm_endpoint() -> (String, String) {
+    let app = llm_app();
+    // GPU: the house Vulkan server + offload travel with the ensure call,
+    // so the magpie slot stays GPU-backed across evictions/restarts.
+    // Opt out with MAGPIE_GPU=0 (falls back to default CPU binary).
+    let gpu = std::env::var("MAGPIE_GPU").map(|v| v != "0").unwrap_or(true);
+    let mut cmd = tokio::process::Command::new("menagerie");
+    cmd.args(["ensure", &app]);
+    if gpu {
+        cmd.env("PIXIE_LLAMA_SERVER", format!("{}/.local/lib/llama-vulkan/llama-server-vk", std::env::var("HOME").unwrap_or_else(|_| "/home/evenweaker".into())));
+        cmd.env("PIXIE_LLM_NGL", "99");
+    }
+    let out = cmd.output().await;
+    if out.map(|o| o.status.success()).unwrap_or(false) {
+        if let Ok(p) = tokio::process::Command::new("menagerie")
+            .args(["path", &app])
+            .output()
+            .await
+        {
+            let txt = String::from_utf8_lossy(&p.stdout);
+            for ln in txt.lines() {
+                if let Some(url) = ln.strip_prefix("URL=") {
+                    let url = url.trim().to_string();
+                    if !url.is_empty() {
+                        return (url, format!("llm:{app}"));
+                    }
+                }
+            }
+        }
+    }
+    // fallbacks keep old behavior working when menagerie is absent
+    if let Ok(u) = std::env::var("PIXIE_LLM_URL") {
+        if !u.trim().is_empty() {
+            return (u, "llm:env".into());
+        }
+    }
+    ("http://127.0.0.1:8080".into(), "llm:pixie-fallback".into())
 }
 
 const VALID_KINDS: &[&str] = &["spec", "fault", "review", "dimensions", "other"];
@@ -43,7 +87,7 @@ async fn chat_once(client: &reqwest::Client, url: &str, body: &serde_json::Value
         .map_err(|e| format!("body:{e}"))
 }
 
-async fn process_one(client: &reqwest::Client, base: &str, title: &str, text: &str) -> (String, Vec<String>, Vec<[String; 2]>, String) {
+async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, base: &str, title: &str, text: &str) -> (String, Vec<String>, Vec<[String; 2]>, String) {
     let excerpt: String = text.chars().take(800).collect();
     let sys = "You classify web pages for a vehicle owner's manual. Reply with ONLY a single JSON object, no other text.";
     let user = format!(
@@ -55,14 +99,17 @@ async fn process_one(client: &reqwest::Client, base: &str, title: &str, text: &s
         "max_tokens": 220,
         "response_format": {"type": "json_object"},
     });
-    let url = format!("{base}/v1/chat/completions", base = llm_url().trim_end_matches('/'));
+    let url = format!("{base}/v1/chat/completions", base = endpoint.trim_end_matches('/'));
     let mut attempt = chat_once(client, &url, &body).await;
     if attempt.is_err() {
-        // model may have been idle-evicted mid-run: summon once, retry once
-        let _ = tokio::process::Command::new("menagerie")
-            .args(["ensure", "pixie"])
-            .output()
-            .await;
+        // model may have been idle-evicted mid-run: summon its slot once, retry once
+        let mut cmd = tokio::process::Command::new("menagerie");
+        cmd.args(["ensure", &llm_app()]);
+        if std::env::var("MAGPIE_GPU").map(|v| v != "0").unwrap_or(true) {
+            cmd.env("PIXIE_LLAMA_SERVER", format!("{}/.local/lib/llama-vulkan/llama-server-vk", std::env::var("HOME").unwrap_or_else(|_| "/home/evenweaker".into())));
+            cmd.env("PIXIE_LLM_NGL", "99");
+        }
+        let _ = cmd.output().await;
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         attempt = chat_once(client, &url, &body).await;
     }
@@ -105,7 +152,7 @@ async fn process_one(client: &reqwest::Client, base: &str, title: &str, text: &s
         Some((kind, bullets, specs))
     })();
     match parsed {
-        Some((k, b, s)) => (k, b, s, "llm".into()),
+        Some((k, b, s)) => (k, b, s, via_tag.into()),
         None => with_via(heuristic(title, &excerpt), "heuristic:parse"),
     }
 }
@@ -164,30 +211,44 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
     let query = v.get("query").and_then(|q| q.as_str()).unwrap_or("seek").to_string();
     let arr = v.get("pages").and_then(|p| p.as_array()).cloned().unwrap_or_default();
     let total = arr.len();
-    // summon the local model first (menagerie idle-evicts); heuristic tags the fallback
+    // route inference through menagerie (house control plane): ensure the
+    // magpie slot, resolve its URL. No raw-port assumptions.
+    let app = llm_app();
     if let Some(tx) = &prog {
-        let _ = tx.send("ensure pixie model…".into());
+        let _ = tx.send(format!("ensure {app} model…"));
     }
-    let ensured = tokio::process::Command::new("menagerie")
-        .args(["ensure", "pixie"])
-        .output()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    let (endpoint, via_tag) = llm_endpoint().await;
     if let Some(tx) = &prog {
-        let _ = tx.send(if ensured { "model ready".into() } else { "model summon failed — heuristic fallback".into() });
+        let _ = tx.send(format!("model: {endpoint}"));
     }
     let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().map_err(|e| MagpieError::Network(e.to_string()))?;
     let mut entries = vec![];
+    // corroboration map: keeper index -> dup count (dups skip the LLM pass)
+    let mut corrobor: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    // index map: seek.json page position -> entries position (keepers only)
+    let mut keeper_at: Vec<Option<usize>> = vec![None; arr.len()];
     for (i, p) in arr.iter().enumerate() {
+        if p.get("dup_of").and_then(|d| d.as_u64()).is_some() {
+            continue;
+        }
+        keeper_at[i] = Some(entries.len());
         let url = p.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string();
         let title = p.get("title").and_then(|u| u.as_str()).unwrap_or("").to_string();
         let text = p.get("text").and_then(|u| u.as_str()).unwrap_or("").to_string();
         if let Some(tx) = &prog {
-            let _ = tx.send(format!("pixie {}/{} {}", i + 1, total, url.chars().take(50).collect::<String>()));
+            let _ = tx.send(format!("pixie {}/{} {}", entries.len() + 1, total, url.chars().take(50).collect::<String>()));
         }
-        let (kind, bullets, specs, via) = process_one(&client, &url, &title, &text).await;
-        entries.push(Entry { url, title, kind, via, bullets, specs });
+        let (kind, bullets, specs, via) = process_one(&client, &endpoint, &via_tag, &url, &title, &text).await;
+        entries.push(Entry { url, title, kind, via, bullets, specs, claimed_by: 0 });
+    }
+    // second pass: attribute dups to their keepers (entries index space)
+    for p in arr.iter() {
+        if let Some(k) = p.get("dup_of").and_then(|d| d.as_u64()).and_then(|k| keeper_at.get(k as usize).copied().flatten()) {
+            *corrobor.entry(k).or_insert(0) += 1;
+        }
+    }
+    for (ei, e) in entries.iter_mut().enumerate() {
+        e.claimed_by = *corrobor.get(&ei).unwrap_or(&0);
     }
     let out = serde_json::json!({
         "query": query,
@@ -206,6 +267,7 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
             title: e.title.clone(),
             url: e.url.clone(),
             via: e.via.clone(),
+            claimed_by: e.claimed_by,
             bullets: e.bullets.clone(),
             specs: e.specs.clone(),
         })

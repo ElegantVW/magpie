@@ -22,16 +22,19 @@ fn norm_words(t: &str) -> HashSet<String> {
         .collect()
 }
 
-/// Drop near-duplicate page texts (Jaccard ≥ 0.8 on words), keep the longer.
-fn dedupe_text(pages: &mut Vec<Page>) {
-    let mut keep = vec![true; pages.len()];
+/// Near-duplicate pass: flag pages whose normalized word overlap ≥80%
+/// as `dup_of` the longer keeper (locale mirrors, syndication).
+/// Repetition is signal: dups are kept as corroboration, not dropped.
+/// Returns the number flagged.
+fn mark_dupes(pages: &mut [Page]) -> usize {
     let sets: Vec<HashSet<String>> = pages.iter().map(|p| norm_words(&p.text)).collect();
+    let mut flagged = 0;
     for i in 0..pages.len() {
-        if !keep[i] {
+        if pages[i].dup_of.is_some() {
             continue;
         }
         for j in (i + 1)..pages.len() {
-            if !keep[j] {
+            if pages[j].dup_of.is_some() {
                 continue;
             }
             let (a, b) = (&sets[i], &sets[j]);
@@ -41,22 +44,17 @@ fn dedupe_text(pages: &mut Vec<Page>) {
             let inter = a.intersection(b).count();
             let union = a.union(b).count();
             if union > 0 && inter as f64 / union as f64 >= 0.8 {
-                // keep the longer text
-                if pages[i].chars >= pages[j].chars {
-                    keep[j] = false;
-                } else {
-                    keep[i] = false;
+                // keeper = longer text
+                let (keeper, dup) = if pages[i].chars >= pages[j].chars { (i, j) } else { (j, i) };
+                pages[dup].dup_of = Some(keeper);
+                flagged += 1;
+                if dup == i {
                     break;
                 }
             }
         }
     }
-    let mut k = 0;
-    pages.retain(|_| {
-        let r = keep[k];
-        k += 1;
-        r
-    });
+    flagged
 }
 
 pub async fn run_seek(query: String, depth: String, pages_n: usize, out: Option<String>, no_pdf: bool) -> Result<std::path::PathBuf> {
@@ -99,11 +97,8 @@ pub async fn run_seek_with_progress(
             pages.append(&mut more);
         }
     }
-    // near-duplicate pass: drop pages whose normalized word overlap ≥80%
-    // (locale mirrors that slipped through, e.g. auto-data /en vs /bg)
-    let before = pages.len();
-    dedupe_text(&mut pages);
-    let dropped = before.saturating_sub(pages.len());
+    // near-duplicate pass: flag mirrors as dup_of (kept as corroboration)
+    let dupes = mark_dupes(&mut pages);
     // rank: spec density + length, drop spam hosts already filtered
     // score = chars/1000 + 3*spec_hits (numbers+units), prefer tables
     pages.sort_by_key(|p| {
@@ -140,8 +135,8 @@ pub async fn run_seek_with_progress(
     if wiki_only {
         warnings.push("wikipedia-only; refusing to call this thorough".into());
     }
-    if dropped > 0 {
-        warnings.push(format!("dropped {dropped} near-duplicate mirror page(s)"));
+    if dupes > 0 {
+        warnings.push(format!("{dupes} mirror page(s) flagged as corroboration (dup_of)"));
     }
     // source-mix requirement for a real manual: want spec-ish + fault/review-ish
     {

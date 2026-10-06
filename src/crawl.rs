@@ -11,6 +11,11 @@ pub struct Page {
     pub title: String,
     pub text: String,
     pub chars: usize,
+    /// Knowledge layer: Some(keeper_index) when this page near-duplicates
+    /// another (locale mirror, syndication). Keepers carry the facts;
+    /// dups corroborate them. Pixie pass skips dups (saves compute).
+    #[serde(default)]
+    pub dup_of: Option<usize>,
 }
 
 fn client() -> reqwest::Client {
@@ -85,6 +90,7 @@ async fn fetch_one(url: &str) -> Result<Page> {
         title,
         text: text.clone(),
         chars,
+        dup_of: None,
     })
 }
 
@@ -223,6 +229,61 @@ fn wikipedia_api(query: &str) -> String {
     )
 }
 
+/// Wikipedia family: en/de/pl/it opensearch (proven car-spec value:
+///
+/// German datasheets, Polish Multijet pages). Always reachable.
+async fn wiki_family(query: &str) -> Vec<String> {
+    let mut out = vec![];
+    for lang in ["en", "de", "pl", "it"] {
+        let url = format!(
+            "https://{lang}.wikipedia.org/w/api.php?action=opensearch&search={}&limit=4&format=json",
+            url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>()
+        );
+        if let Ok(p) = fetch_one(&url).await {
+            for cap in Regex::new(r#"https?://[a-z]+\.wikipedia\.org/wiki/[^\s"\\]+"#)
+                .unwrap()
+                .captures_iter(&p.text)
+            {
+                out.push(cap[0].to_string());
+                if out.len() >= 8 {
+                    return out;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Vertical top-up: `site:`-scoped queries against hosts where spec
+/// tables actually live, through the DDG leg.
+async fn site_scoped(query: &str, prog: &Option<tokio::sync::mpsc::UnboundedSender<String>>) -> Vec<String> {
+    const VERTICALS: &[&str] = &[
+        "ultimatespecs.com",
+        "cars-data.com",
+        "parkers.co.uk",
+        "rac.co.uk",
+        "honestjohn.co.uk",
+        "adac.de",
+    ];
+    let mut out = vec![];
+    for host in VERTICALS {
+        let q = format!("{query} site:{host}");
+        let mut hits = ddg_search(&q, 2).await;
+        // keep only hits actually on the vertical (DDG may ignore site:)
+        hits.retain(|u| u.to_lowercase().contains(host));
+        if !hits.is_empty() {
+            if let Some(tx) = prog {
+                let _ = tx.send(format!("search: {host} got {}", hits.len()));
+            }
+            out.extend(hits);
+        }
+        if out.len() >= 8 {
+            break;
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CrawlPlan {
     pub urls: Vec<String>,
@@ -281,28 +342,61 @@ pub async fn plan_urls(
         }
     }
     if urls.len() < max_pages {
-        send("search: wikipedia…");
-        match tokio::time::timeout(std::time::Duration::from_secs(15), fetch_one(&wikipedia_api(query))).await {
-            Ok(Ok(p)) => {
-                let mut n = 0;
-                for cap in Regex::new(r#""title":"([^"]+)""#)
-                    .unwrap()
-                    .captures_iter(&p.text)
-                    .take(wiki_n)
-                {
-                    let t = cap[1].replace(' ', "_");
-                    let u = format!("https://en.wikipedia.org/wiki/{t}");
-                    if seen.insert(u.clone()) {
+        send("search: wikipedia (en/de/pl/it)…");
+        let mut n = 0;
+        for u in wiki_family(query).await {
+            if spam_url(&u) {
+                continue;
+            }
+            if !seen.insert(canon_url(&u)) {
+                continue;
+            }
+            urls.push(u);
+            n += 1;
+            if urls.len() >= max_pages || n >= 6 {
+                break;
+            }
+        }
+        send(&format!("search: wikipedia got {n}"));
+        // legacy en API as backup when opensearch yields little
+        if n < 2 {
+            match tokio::time::timeout(std::time::Duration::from_secs(15), fetch_one(&wikipedia_api(query))).await {
+                Ok(Ok(p)) => {
+                    for cap in Regex::new(r#""title":"([^"]+)""#)
+                        .unwrap()
+                        .captures_iter(&p.text)
+                        .take(wiki_n)
+                    {
+                        let t = cap[1].replace(' ', "_");
+                        let u = format!("https://en.wikipedia.org/wiki/{t}");
+                        if !seen.insert(canon_url(&u)) {
+                            continue;
+                        }
                         urls.push(u);
                         n += 1;
+                        if urls.len() >= max_pages {
+                            break;
+                        }
                     }
-                    if urls.len() >= max_pages {
-                        break;
-                    }
+                    send(&format!("search: wikipedia got {n}"));
                 }
-                send(&format!("search: wikipedia got {n}"));
+                _ => send("search: wikipedia backup failed, continuing…"),
             }
-            _ => send("search: wikipedia timed out/failed, continuing…"),
+        }
+    }
+    if urls.len() < max_pages {
+        send("search: verticals (site:)…");
+        for u in site_scoped(query, &prog).await {
+            if spam_url(&u) {
+                continue;
+            }
+            if !seen.insert(canon_url(&u)) {
+                continue;
+            }
+            urls.push(u);
+            if urls.len() >= max_pages {
+                break;
+            }
         }
     }
     if depth != "quick" && urls.len() < max_pages {

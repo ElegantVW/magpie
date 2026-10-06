@@ -4,7 +4,7 @@
 
 Rust engine for [faeOS](https://github.com/ElegantVW/faeOS). One binary: TUI + seek + PDF. Privacy-first: DDG + Marginalia, never Google. Thorough by default: many various sources, never wikipedia-only.
 
-Status: v0.1 TUI prompt box + `seek` + local PDF (`seek.json` + `processed.json` + `manual.pdf`).
+Status: TUI prompt box + `seek`/`process`/`manual` + local PDF (`seek.json` + `processed.json` + `dump.pdf`/`manual.pdf`).
 
 ```
   /\
@@ -13,6 +13,20 @@ Status: v0.1 TUI prompt box + `seek` + local PDF (`seek.json` + `processed.json`
 /    \
 \    /
 ```
+
+## GPU
+
+llama.cpp is built with Vulkan (`~/.local/src/llama.cpp`, headers in
+`~/.local/vulkan-deps`). The server lives at
+`~/.local/lib/llama-vulkan/` (`llama-server-vk` wrapper sets
+`LD_LIBRARY_PATH`); the stock `~/bin/llama-server` is untouched.
+The magpie slot runs `qwen3-4b` on the RX 5700 XT
+(`PIXIE_LLAMA_SERVER=…/llama-server-vk PIXIE_LLM_NGL=99 menagerie set magpie …`):
+~150 tok/s prompt, ~120 tok/s gen — per-entry ~2-10s.
+`process` passes that env on every `ensure`, so the slot self-heals
+GPU-backed across evictions. Opt out with `MAGPIE_GPU=0`.
+Switch models with `menagerie set magpie <name>`; pick the app with
+`MAGPIE_LLM_APP=<app>`.
 
 ## Use
 
