@@ -46,6 +46,7 @@ pub struct ManualEntry {
     pub url: String,
     pub via: String,
     pub claimed_by: usize,
+    pub quotes: Vec<String>,
     pub bullets: Vec<String>,
     pub specs: Vec<[String; 2]>,
 }
@@ -122,12 +123,16 @@ fn callout(doc: &mut Vec<Line>, label: &str, text: &str) {
 /// Structured manual: cover + TOC + grouped sections + sources.
 /// Groups follow the Corsa-manual order: spec, fault, review, dimensions, other.
 pub fn render_manual(query: &str, entries: &[ManualEntry], hosts: &[String], out: &std::path::Path) -> Result<()> {
-    let order = ["spec", "fault", "review", "dimensions", "other"];
+    let order = ["spec", "fault", "review", "dimensions", "facts", "howto", "reference", "history", "other"];
     let titles = [
         "Specifications",
         "Faults & reliability",
         "Reviews & driving",
         "Dimensions & practicality",
+        "Facts",
+        "How-to",
+        "Reference",
+        "History",
         "Other sources",
     ];
     let grouped: Vec<(usize, Vec<&ManualEntry>)> = order
@@ -154,6 +159,13 @@ pub fn render_manual(query: &str, entries: &[ManualEntry], hosts: &[String], out
             }
             if !e.specs.is_empty() {
                 spec_table(&mut doc, &e.specs);
+            }
+            // producer receipts: verbatim spans, never synthesized prose
+            for q in e.quotes.iter().take(3) {
+                for (i, ln) in wrap(q, 88).iter().enumerate() {
+                    let t = if i == 0 { format!("  \"{ln}") } else { format!("   {ln}") };
+                    doc.push(Line { text: t, size: 8.0, bold: false, units: 1 });
+                }
             }
         }
         if titles[*i].starts_with("Faults") {

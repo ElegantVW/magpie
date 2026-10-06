@@ -241,6 +241,300 @@ fn alias_queries(query: &str) -> Vec<String> {
     out
 }
 
+/// Internet Archive books: public-domain/open full text only.
+/// advancedsearch → metadata (confirm `_djvu.txt` exists) → download.
+/// Lending-library and restricted items never qualify — listed, never fetched.
+async fn ia_books(query: &str, prog: &Option<tokio::sync::mpsc::UnboundedSender<String>>) -> Vec<Page> {
+    let send = |m: &str| {
+        if let Some(tx) = prog {
+            let _ = tx.send(m.to_string());
+        }
+    };
+    send("search: archive.org books…");
+    let c = client();
+    let q = format!(
+        "https://archive.org/advancedsearch.php?q={}+AND+mediatype%3Atexts&fl%5B%5D=identifier&fl%5B%5D=title&fl%5B%5D=year&rows=12&output=json",
+        url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>()
+    );
+    let txt = match c.get(&q).send().await {
+        Ok(r) => r.text().await.unwrap_or_default(),
+        Err(_) => return vec![],
+    };
+    let v: serde_json::Value = match serde_json::from_str(&txt) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+    let docs = v["response"]["docs"].as_array().cloned().unwrap_or_default();
+    let mut out = vec![];
+    for d in docs {
+        if out.len() >= 3 {
+            break;
+        }
+        let id = d.get("identifier").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let title = d.get("title").and_then(|x| x.as_str()).unwrap_or(&id).to_string();
+        if id.is_empty() {
+            continue;
+        }
+        // metadata: only proceed with a real full-text file present
+        let meta = match c.get(&format!("https://archive.org/metadata/{id}")).send().await {
+            Ok(r) => r.text().await.unwrap_or_default(),
+            Err(_) => continue,
+        };
+        if !meta.contains("_djvu.txt") {
+            continue;
+        }
+        let body = match c.get(&format!("https://archive.org/download/{id}/{id}_djvu.txt")).send().await {
+            Ok(r) => r.text().await.unwrap_or_default(),
+            Err(_) => continue,
+        };
+        // trim front-matter boilerplate, keep the body
+        let text = body.chars().take(12000).collect::<String>();
+        if text.chars().count() < 2000 {
+            continue;
+        }
+        let chars = text.chars().count();
+        out.push(Page {
+            url: format!("https://archive.org/details/{id}"),
+            title: format!("{title} — Internet Archive"),
+            text,
+            chars,
+            dup_of: None,
+        });
+        send(&format!("search: archive.org got {title}"));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+    out
+}
+
+/// Wikisource: full text of public-domain works (same canon pool as IA).
+async fn wikisource_search(query: &str) -> Vec<Page> {
+    let c = client();
+    let s = match c
+        .get(&format!(
+            "https://en.wikisource.org/w/api.php?action=query&list=search&srsearch={}&format=json&srlimit=4",
+            url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>()
+        ))
+        .send()
+        .await
+    {
+        Ok(r) => r.text().await.unwrap_or_default(),
+        Err(_) => return vec![],
+    };
+    let v: serde_json::Value = serde_json::from_str(&s).unwrap_or(serde_json::Value::Null);
+    let hits = v["query"]["search"].as_array().cloned().unwrap_or_default();
+    let mut out = vec![];
+    for h in hits {
+        let title = h.get("title").and_then(|t| t.as_str()).unwrap_or("").to_string();
+        if title.is_empty() {
+            continue;
+        }
+        let t = match c
+            .get(&format!(
+                "https://en.wikisource.org/w/api.php?action=query&prop=extracts&explaintext=1&titles={}&format=json",
+                url::form_urlencoded::byte_serialize(title.as_bytes()).collect::<String>()
+            ))
+            .send()
+            .await
+        {
+            Ok(r) => r.text().await.unwrap_or_default(),
+            Err(_) => continue,
+        };
+        let v: serde_json::Value = serde_json::from_str(&t).unwrap_or(serde_json::Value::Null);
+        let mut text = String::new();
+        if let Some(pages) = v["query"]["pages"].as_object() {
+            for (_, p) in pages {
+                if let Some(x) = p.get("extract").and_then(|e| e.as_str()) {
+                    text.push_str(x);
+                }
+            }
+        }
+        let text: String = text.chars().take(12000).collect();
+        if text.chars().count() < 500 {
+            continue;
+        }
+        let chars = text.chars().count();
+        out.push(Page {
+            url: format!(
+                "https://en.wikisource.org/wiki/{}",
+                title.replace(' ', "_")
+            ),
+            title: format!("{title} — Wikisource"),
+            text,
+            chars,
+            dup_of: None,
+        });
+        if out.len() >= 2 {
+            break;
+        }
+    }
+    out
+}
+
+/// TheCocktailDB: structured drink canon (ingredients/measures/method).
+/// Fires only when it actually has the drink (null otherwise) — cheap probe.
+async fn cocktaildb(query: &str) -> Vec<Page> {
+    let c = client();
+    let mut tries = vec![query.to_string()];
+    let longest: Option<String> = query
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| t.len() > 3)
+        .max_by_key(|t| t.len())
+        .map(|t| t.to_string());
+    if let Some(l) = longest {
+        if l.to_lowercase() != query.to_lowercase() {
+            tries.push(l);
+        }
+    }
+    for q in tries {
+        let url = format!(
+            "https://www.thecocktaildb.com/api/json/v1/1/search.php?s={}",
+            url::form_urlencoded::byte_serialize(q.as_bytes()).collect::<String>()
+        );
+        let txt = match c.get(&url).send().await {
+            Ok(r) => r.text().await.unwrap_or_default(),
+            Err(_) => continue,
+        };
+        let v: serde_json::Value = match serde_json::from_str(&txt) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let drinks = v.get("drinks").and_then(|d| d.as_array()).cloned().unwrap_or_default();
+        if drinks.is_empty() {
+            continue;
+        }
+        let mut out = vec![];
+        for d in drinks.iter().take(4) {
+            let name = d.get("strDrink").and_then(|x| x.as_str()).unwrap_or("drink").to_string();
+            let mut lines = vec![format!("{name} (TheCocktailDB)")];
+            for k in ["strCategory", "strGlass", "strInstructions"] {
+                if let Some(x) = d.get(k).and_then(|x| x.as_str()) {
+                    if !x.is_empty() {
+                        lines.push(format!("{}: {}", k.trim_start_matches("str"), x.chars().take(400).collect::<String>()));
+                    }
+                }
+            }
+            for i in 1..=8 {
+                let ing = d.get(&format!("strIngredient{i}")).and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+                let mea = d.get(&format!("strMeasure{i}")).and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+                if ing.is_empty() {
+                    continue;
+                }
+                lines.push(format!("- {} {}", ing, mea.trim_end()));
+            }
+            let text = lines.join("\n");
+            let chars = text.chars().count();
+            out.push(Page {
+                url: format!("https://www.thecocktaildb.com/drink/{name}"),
+                title: format!("{name} — CocktailDB"),
+                text,
+                chars,
+                dup_of: None,
+            });
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    vec![]
+}
+
+/// Open Library: edition metadata for the bibliography (author/year/publisher).
+async fn openlibrary(query: &str) -> Vec<Page> {
+    let c = client();
+    let txt = match c
+        .get(&format!(
+            "https://openlibrary.org/search.json?q={}&limit=4&fields=title,author_name,first_publish_year,publisher,key",
+            url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>()
+        ))
+        .send()
+        .await
+    {
+        Ok(r) => r.text().await.unwrap_or_default(),
+        Err(_) => return vec![],
+    };
+    let v: serde_json::Value = serde_json::from_str(&txt).unwrap_or(serde_json::Value::Null);
+    let docs = v.get("docs").and_then(|d| d.as_array()).cloned().unwrap_or_default();
+    if docs.is_empty() {
+        return vec![];
+    }
+    let mut lines = vec![format!("Open Library editions for “{query}” (bibliography):")];
+    for d in docs.iter().take(4) {
+        let t = d.get("title").and_then(|x| x.as_str()).unwrap_or("?");
+        let a = d
+            .get("author_name")
+            .and_then(|x| x.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))
+            .unwrap_or_else(|| "?".into());
+        let y = d.get("first_publish_year").map(|x| x.to_string()).unwrap_or_else(|| "?".into());
+        let k = d.get("key").and_then(|x| x.as_str()).unwrap_or("");
+        lines.push(format!("- {t} — {a} ({y}) https://openlibrary.org{k}"));
+    }
+    let text = lines.join("\n");
+    let chars = text.chars().count();
+    vec![Page {
+        url: format!("https://openlibrary.org/search?q={query}"),
+        title: format!("Open Library: {query}"),
+        text,
+        chars,
+        dup_of: None,
+    }]
+}
+
+/// Wikidata entity traversal: top entities for the query contribute their
+/// article sitelinks as seed URLs (finds "Cocktail" from "mixology").
+async fn wiki_related(query: &str) -> Vec<String> {
+    let c = client();
+    let s = match c
+        .get(&format!(
+            "https://www.wikidata.org/w/api.php?action=wbsearchentities&search={}&language=en&format=json&limit=5",
+            url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>()
+        ))
+        .send()
+        .await
+    {
+        Ok(r) => r.text().await.unwrap_or_default(),
+        Err(_) => return vec![],
+    };
+    let ids: Vec<String> = Regex::new(r#""id":"(Q\d+)""#)
+        .unwrap()
+        .captures_iter(&s)
+        .map(|c| c[1].to_string())
+        .take(5)
+        .collect();
+    if ids.is_empty() {
+        return vec![];
+    }
+    let e = match c
+        .get(&format!(
+            "https://www.wikidata.org/w/api.php?action=wbgetentities&ids={}&props=sitelinks&sitefilter=enwiki&format=json",
+            ids.join("|")
+        ))
+        .send()
+        .await
+    {
+        Ok(r) => r.text().await.unwrap_or_default(),
+        Err(_) => return vec![],
+    };
+    let v: serde_json::Value = serde_json::from_str(&e).unwrap_or(serde_json::Value::Null);
+    let mut out = vec![];
+    if let Some(ents) = v.get("entities").and_then(|e| e.as_object()) {
+        for ent in ents.values() {
+            if let Some(title) = ent
+                .get("sitelinks")
+                .and_then(|s| s.get("enwiki"))
+                .and_then(|s| s.get("title"))
+                .and_then(|t| t.as_str())
+            {
+                out.push(format!("https://en.wikipedia.org/wiki/{}", title.replace(' ', "_")));
+                if out.len() >= 4 {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
 fn wikipedia_api(query: &str) -> String {
     format!(
         "https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={}&format=json&srlimit=5",
@@ -654,6 +948,9 @@ pub async fn plan_urls(
     }
     if urls.len() < max_pages {
         send("search: wikipedia (en/de/pl/it)…");
+        // flood guard: encyclopedia share capped so one exempt leg can't
+        // become the whole corpus on single-token queries (see mixology)
+        let wiki_cap = (max_pages * 4 / 10).max(2);
         let mut n = 0;
         for u in wiki_family(query).await {
             if spam_url(&u) {
@@ -664,7 +961,7 @@ pub async fn plan_urls(
             }
             urls.push(u);
             n += 1;
-            if urls.len() >= max_pages || n >= 6 {
+            if urls.len() >= max_pages || n >= wiki_cap {
                 break;
             }
         }
@@ -706,6 +1003,52 @@ pub async fn plan_urls(
             }
             urls.push(u);
             if urls.len() >= max_pages {
+                break;
+            }
+        }
+    }
+    // book + structured-drink legs: no search engine, no key.
+    // IA/Wikisource/OpenLibrary are field-agnostic (sciences, art,
+    // history); CocktailDB fires only when it has the drink.
+    {
+        send("search: books (archive.org)…");
+        for p in ia_books(query, &prog).await {
+            if spam_url(&p.url) || !seen.insert(canon_url(&p.url)) {
+                continue;
+            }
+            prefetched.push(p);
+        }
+        send("search: wikisource…");
+        for p in wikisource_search(query).await {
+            if spam_url(&p.url) || !seen.insert(canon_url(&p.url)) {
+                continue;
+            }
+            prefetched.push(p);
+        }
+        for p in cocktaildb(query).await {
+            if spam_url(&p.url) || !seen.insert(canon_url(&p.url)) {
+                continue;
+            }
+            prefetched.push(p);
+        }
+        send("search: openlibrary…");
+        for p in openlibrary(query).await {
+            if spam_url(&p.url) || !seen.insert(canon_url(&p.url)) {
+                continue;
+            }
+            prefetched.push(p);
+        }
+    }
+    // entity traversal: top wikidata entities seed their articles
+    // ("mixology" -> Cocktail, Bartender, List of cocktails…)
+    if urls.len() < max_pages + 4 {
+        send("search: wikidata related…");
+        for u in wiki_related(query).await {
+            if spam_url(&u) || !seen.insert(canon_url(&u)) {
+                continue;
+            }
+            urls.push(u);
+            if urls.len() >= max_pages + 4 {
                 break;
             }
         }

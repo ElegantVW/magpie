@@ -17,6 +17,8 @@ struct Entry {
     via: String,
     bullets: Vec<String>,
     specs: Vec<[String; 2]>,
+    /// verbatim spans (≤90 chars) for the bibliography
+    quotes: Vec<String>,
     /// corroboration: how many dup pages repeat this keeper
     claimed_by: usize,
 }
@@ -67,7 +69,7 @@ async fn llm_endpoint() -> (String, String) {
     ("http://127.0.0.1:8080".into(), "llm:pixie-fallback".into())
 }
 
-const VALID_KINDS: &[&str] = &["spec", "fault", "review", "dimensions", "other"];
+const VALID_KINDS: &[&str] = &["spec", "fault", "review", "dimensions", "facts", "howto", "reference", "history", "other"];
 
 /// One quick LLM task per entry via OpenAI chat endpoint with enforced
 /// `response_format: json_object`. Returns (kind, bullets, specs, via).
@@ -87,16 +89,16 @@ async fn chat_once(client: &reqwest::Client, url: &str, body: &serde_json::Value
         .map_err(|e| format!("body:{e}"))
 }
 
-async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, base: &str, title: &str, text: &str) -> (String, Vec<String>, Vec<[String; 2]>, String) {
+async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, base: &str, title: &str, text: &str) -> (String, Vec<String>, Vec<[String; 2]>, Vec<String>, String) {
     let excerpt: String = text.chars().take(800).collect();
-    let sys = "You classify web pages for a vehicle owner's manual. Reply with ONLY a single JSON object, no other text.";
+    let sys = "You file web pages into a knowledge manual. Reply with ONLY a single JSON object, no other text. Quotes must be copied EXACTLY from the text, at most 90 characters each. Kinds: spec/fault/review/dimensions for vehicles and machines; facts/howto/reference/history for everything else; other as last resort.";
     let user = format!(
-        "{{\"task\": \"classify\", \"title\": \"{title}\", \"url\": \"{base}\", \"text\": \"{excerpt}\", \"want\": {{\"kind\": \"spec|fault|review|dimensions|other\", \"bullets\": [\"up to 3 facts\"], \"specs\": [[\"key\", \"value\"]]}}}}"
+        "{{\"task\": \"classify\", \"title\": \"{title}\", \"url\": \"{base}\", \"text\": \"{excerpt}\", \"want\": {{\"kind\": \"spec|fault|review|dimensions|facts|howto|reference|history|other\", \"bullets\": [\"up to 3 facts\"], \"specs\": [[\"key\", \"value\"]], \"quotes\": [\"up to 3 verbatim spans\"]}}}}"
     );
     let body = serde_json::json!({
         "messages": [{"role": "system", "content": sys}, {"role": "user", "content": user}],
         "temperature": 0.1,
-        "max_tokens": 220,
+        "max_tokens": 280,
         "response_format": {"type": "json_object"},
         "tools": [{
             "type": "function",
@@ -106,11 +108,13 @@ async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, ba
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "kind": {"type": "string", "enum": ["spec", "fault", "review", "dimensions", "other"]},
+                        "kind": {"type": "string", "enum": ["spec", "fault", "review", "dimensions", "facts", "howto", "reference", "history", "other"]},
+                        "relevance": {"type": "integer", "minimum": 0, "maximum": 100},
                         "bullets": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
-                        "specs": {"type": "array", "items": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 2}, "maxItems": 6}
+                        "specs": {"type": "array", "items": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 2}, "maxItems": 6},
+                        "quotes": {"type": "array", "items": {"type": "string"}, "maxItems": 3}
                     },
-                    "required": ["kind", "bullets", "specs"]
+                    "required": ["kind", "bullets", "specs", "quotes", "relevance"]
                 }
             }
         }],
@@ -132,7 +136,7 @@ async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, ba
     }
     let txt = match attempt {
         Ok(t) => t,
-        Err(e) => return with_via(heuristic(title, &excerpt), &format!("heuristic:{e}").chars().take(48).collect::<String>()),
+        Err(e) => return with_via(heuristic(title, &excerpt), vec![], &format!("heuristic:{e}").chars().take(48).collect::<String>()),
     };
     // tool contract first: choices[0].message.tool_calls[0].function.arguments
     // (real function call, not prose). This server build may instead emit
@@ -162,7 +166,7 @@ async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, ba
                 Some(v)
             }
         });
-    let parsed: Option<(String, Vec<String>, Vec<[String; 2]>, bool)> = (|| {
+    let parsed: Option<(String, Vec<String>, Vec<[String; 2]>, Vec<String>, bool, i64)> = (|| {
         // prefer the tool call; then the envelope; fall back to raw content JSON
         let (v, tooled): (serde_json::Value, bool) = match tool_args {
             Some(t) => (t, true),
@@ -170,6 +174,9 @@ async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, ba
         };
         let raw_kind = v.get("kind").and_then(|k| k.as_str()).unwrap_or("other").to_lowercase();
         let kind = if VALID_KINDS.contains(&raw_kind.as_str()) { raw_kind } else { "other".into() };
+        // relevance gate: the model scores fit to the query; <40 never
+        // reaches the manual (Mixolydian-mode class of drift)
+        let relevance: i64 = v.get("relevance").and_then(|r| r.as_i64()).unwrap_or(50);
         let bullets: Vec<String> = v
             .get("bullets")
             .and_then(|b| b.as_array())
@@ -195,20 +202,37 @@ async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, ba
                     .collect()
             })
             .unwrap_or_default();
-        if bullets.is_empty() && specs.is_empty() {
+        // verbatim spans for the bibliography: capped, de-emptied
+        let quotes: Vec<String> = v
+            .get("quotes")
+            .and_then(|b| b.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str())
+                    .map(|s| s.trim().chars().take(90).collect::<String>())
+                    .filter(|s| !s.is_empty())
+                    .take(3)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if bullets.is_empty() && specs.is_empty() && quotes.is_empty() {
             return None;
         }
-        Some((kind, bullets, specs, tooled))
+        Some((kind, bullets, specs, quotes, tooled, relevance))
     })();
     match parsed {
-        Some((k, b, s, true)) => (k, b, s, format!("{via_tag}:tool")),
-        Some((k, b, s, false)) => (k, b, s, format!("{via_tag}:json")),
-        None => with_via(heuristic(title, &excerpt), "heuristic:parse"),
+        Some((k, b, s, q, true, r)) if r >= 40 => (k, b, s, q, format!("{via_tag}:tool")),
+        Some((k, b, s, q, false, r)) if r >= 40 => (k, b, s, q, format!("{via_tag}:json")),
+        Some(_) => return with_via(heuristic(title, &excerpt), vec![], "heuristic:irrelevant"),
+        None => {
+            let (k, b, s) = heuristic(title, &excerpt);
+            (k, b, s, vec![], "heuristic:parse".into())
+        }
     }
 }
 
-fn with_via(h: (String, Vec<String>, Vec<[String; 2]>), via: &str) -> (String, Vec<String>, Vec<[String; 2]>, String) {
-    (h.0, h.1, h.2, via.into())
+fn with_via(h: (String, Vec<String>, Vec<[String; 2]>), quotes: Vec<String>, via: &str) -> (String, Vec<String>, Vec<[String; 2]>, Vec<String>, String) {
+    (h.0, h.1, h.2, quotes, via.into())
 }
 
 fn heuristic(title: &str, text: &str) -> (String, Vec<String>, Vec<[String; 2]>) {
@@ -273,6 +297,7 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
     }
     let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().map_err(|e| MagpieError::Network(e.to_string()))?;
     let mut entries = vec![];
+    let mut dropped_irrelevant = 0;
     // corroboration map: keeper index -> dup count (dups skip the LLM pass)
     let mut corrobor: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     // index map: seek.json page position -> entries position (keepers only)
@@ -288,8 +313,17 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
         if let Some(tx) = &prog {
             let _ = tx.send(format!("pixie {}/{} {}", entries.len() + 1, total, url.chars().take(50).collect::<String>()));
         }
-        let (kind, bullets, specs, via) = process_one(&client, &endpoint, &via_tag, &url, &title, &text).await;
-        entries.push(Entry { url, title, kind, via, bullets, specs, claimed_by: 0 });
+        let (kind, bullets, specs, quotes, via) = process_one(&client, &endpoint, &via_tag, &url, &title, &text).await;
+        // relevance gate: model-scored <40 never reaches the manual
+        if via == "heuristic:irrelevant" {
+            if let Some(tx) = &prog {
+                let _ = tx.send(format!("drop irrelevant: {}", title.chars().take(50).collect::<String>()));
+            }
+            keeper_at[i] = None;
+            dropped_irrelevant += 1;
+            continue;
+        }
+        entries.push(Entry { url, title, kind, via, bullets, specs, quotes, claimed_by: 0 });
     }
     // second pass: attribute dups to their keepers (entries index space)
     for p in arr.iter() {
@@ -304,6 +338,7 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
         "query": query,
         "title": format!("{query} — manual"),
         "entries": entries,
+        "dropped_irrelevant": dropped_irrelevant,
     });
     std::fs::write(dir.join("processed.json"), serde_json::to_string_pretty(&out).unwrap()).map_err(|e| MagpieError::Io(e.to_string()))?;
     if let Some(tx) = &prog {
@@ -318,6 +353,7 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
             url: e.url.clone(),
             via: e.via.clone(),
             claimed_by: e.claimed_by,
+            quotes: e.quotes.clone(),
             bullets: e.bullets.clone(),
             specs: e.specs.clone(),
         })

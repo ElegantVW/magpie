@@ -22,6 +22,7 @@ struct EntryRow {
     via: String,
     claimed_by: usize,
     bullets: Vec<String>,
+    quotes: Vec<String>,
 }
 
 fn load_entries(dir: &PathBuf) -> Vec<EntryRow> {
@@ -39,6 +40,11 @@ fn load_entries(dir: &PathBuf) -> Vec<EntryRow> {
                     claimed_by: e.get("claimed_by").and_then(|k| k.as_u64()).unwrap_or(0) as usize,
                     bullets: e
                         .get("bullets")
+                        .and_then(|b| b.as_array())
+                        .map(|b| b.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).take(3).collect())
+                        .unwrap_or_default(),
+                    quotes: e
+                        .get("quotes")
                         .and_then(|b| b.as_array())
                         .map(|b| b.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).take(3).collect())
                         .unwrap_or_default(),
@@ -100,7 +106,10 @@ pub async fn run_tui() -> anyhow::Result<()> {
                             if let Some(e) = entries.get(sel) {
                                 log.push(format!("[{}|{}] {}", e.kind, e.via, e.title));
                                 for b in &e.bullets {
-                                    log.push(format!("  • {b}"));
+                                    log.push(format!("  - {b}"));
+                                }
+                                for q in &e.quotes {
+                                    log.push(format!("  \"{q}\""));
                                 }
                                 log.push(format!("  {}", e.url));
                             }
