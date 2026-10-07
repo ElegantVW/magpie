@@ -91,10 +91,10 @@ async fn chat_once(client: &reqwest::Client, url: &str, body: &serde_json::Value
         .map_err(|e| format!("body:{e}"))
 }
 
-async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, chapters: &[String], base: &str, title: &str, text: &str) -> (String, Vec<String>, Vec<[String; 2]>, Vec<String>, String, String) {
+async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, chapters: &[String], query: &str, base: &str, title: &str, text: &str) -> (String, Vec<String>, Vec<[String; 2]>, Vec<String>, String, String) {
     let excerpt: String = text.chars().take(5000).collect();
     let chlist = chapters.join(" | ");
-    let sys = format!("You file web pages into a knowledge manual. Reply with ONLY a single JSON object, no other text. Quotes must be copied EXACTLY from the text, at most 90 characters each. Score relevance 0 for same-name-different-thing pages (a band, a surname, a music mode sharing the query word). File each page into exactly one chapter: {chlist}.");
+    let sys = format!("You file web pages into a knowledge manual on '{query}'. Reply with ONLY a single JSON object, no other text. Quotes must be copied EXACTLY from the text, at most 90 characters each. Relevance scores whether the page is ABOUT '{query}' itself — never the chapter: a band called Portugal filed under Music & arts, a surname, a music mode sharing one word all score 0 even when the chapter seems to fit. File each page into exactly one chapter: {chlist}.");
     let user = format!(
         "{{\"task\": \"classify\", \"title\": \"{title}\", \"url\": \"{base}\", \"text\": \"{excerpt}\", \"want\": {{\"kind\": \"spec|fault|review|dimensions|facts|howto|reference|history|other\", \"section\": \"one of: {chlist}\", \"bullets\": [\"up to 10 facts\"], \"specs\": [[\"key\", \"value\"] up to 12], \"quotes\": [\"up to 3 verbatim spans\"]}}}}"
     );
@@ -299,7 +299,6 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
     let v: serde_json::Value = serde_json::from_str(&raw).map_err(|e| MagpieError::Parse(e.to_string()))?;
     let query = v.get("query").and_then(|q| q.as_str()).unwrap_or("seek").to_string();
     let arr = v.get("pages").and_then(|p| p.as_array()).cloned().unwrap_or_default();
-    let total = arr.len();
     // producer outline: subject domain from the wikidata synthetic page,
     // chapters from the domain table. The manual renders chapters in order
     // with explicit gap flags where coverage failed.
@@ -326,23 +325,89 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
     }
     let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().map_err(|e| MagpieError::Network(e.to_string()))?;
     let mut entries = vec![];
+    // volume guard: cap keepers so hundred-chunk book pulls stay tractable.
+    // Round-robin across hosts (breadth first), densest first within host.
+    const MAX_KEEPERS: usize = 80;
+    let mut keeper_idx: Vec<usize> = vec![];
+    {
+        let qtokens: Vec<String> = query
+            .to_lowercase()
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|t| t.len() > 2)
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .map(|t| t.to_string())
+            .collect();
+        // per-host buckets, densest first
+        let mut by_host: std::collections::HashMap<String, Vec<(usize, usize)>> = Default::default();
+        for (i, p) in arr.iter().enumerate() {
+            if p.get("dup_of").and_then(|d| d.as_u64()).is_some() {
+                continue;
+            }
+            let t = p.get("text").and_then(|t| t.as_str()).unwrap_or("").to_lowercase();
+            let hits: usize = qtokens.iter().map(|tok| t.matches(tok).count()).sum();
+            let len = p.get("text").and_then(|t| t.as_str()).map(|t| t.chars().count().max(1)).unwrap_or(1);
+            let score = hits.saturating_mul(1000) / len;
+            let host = p.get("url").and_then(|u| u.as_str()).unwrap_or("").split('/').nth(2).unwrap_or("").to_string();
+            by_host.entry(host).or_default().push((score, i));
+        }
+        for v in by_host.values_mut() {
+            v.sort_by(|a, b| b.0.cmp(&a.0));
+        }
+        let mut hosts: Vec<String> = by_host.keys().cloned().collect();
+        hosts.sort();
+        let mut round = 0;
+        loop {
+            let mut added = false;
+            for h in hosts.iter() {
+                if keeper_idx.len() >= MAX_KEEPERS {
+                    break;
+                }
+                if let Some((_, i)) = by_host.get(h).and_then(|v| v.get(round).copied()) {
+                    keeper_idx.push(i);
+                    added = true;
+                }
+            }
+            if !added || keeper_idx.len() >= MAX_KEEPERS {
+                break;
+            }
+            round += 1;
+        }
+    }
     let mut dropped_irrelevant = 0;
     // corroboration map: keeper index -> dup count (dups skip the LLM pass)
     let mut corrobor: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     // index map: seek.json page position -> entries position (keepers only)
     let mut keeper_at: Vec<Option<usize>> = vec![None; arr.len()];
-    for (i, p) in arr.iter().enumerate() {
-        if p.get("dup_of").and_then(|d| d.as_u64()).is_some() {
-            continue;
-        }
+    let kept_total = keeper_idx.len();
+    for (n, i) in keeper_idx.iter().copied().enumerate() {
+        let p = &arr[i];
         keeper_at[i] = Some(entries.len());
         let url = p.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string();
         let title = p.get("title").and_then(|u| u.as_str()).unwrap_or("").to_string();
         let text = p.get("text").and_then(|u| u.as_str()).unwrap_or("").to_string();
         if let Some(tx) = &prog {
-            let _ = tx.send(format!("pixie {}/{} {}", entries.len() + 1, total, url.chars().take(50).collect::<String>()));
+            let _ = tx.send(format!("pixie {}/{} {}", n + 1, kept_total, url.chars().take(50).collect::<String>()));
         }
-        let (kind, bullets, specs, quotes, section, via) = process_one(&client, &endpoint, &via_tag, &chapters, &url, &title, &text).await;
+        let (kind, bullets, specs, quotes, section, via) = process_one(&client, &endpoint, &via_tag, &chapters, &query, &url, &title, &text).await;
+        // namesake filter: parenthetical disambiguators that never belong
+        // in a subject manual (bands, surnames, albums share query words)
+        let tl = title.to_lowercase();
+        if tl.contains("(band)")
+            || tl.contains("(surname)")
+            || tl.contains("(given name)")
+            || tl.contains("(disambiguation)")
+            || tl.contains("(album)")
+            || tl.contains("(song)")
+            || tl.contains("(mode)")
+        {
+            if let Some(tx) = &prog {
+                let _ = tx.send(format!("drop namesake: {}", title.chars().take(50).collect::<String>()));
+            }
+            keeper_at[i] = None;
+            dropped_irrelevant += 1;
+            continue;
+        }
         // relevance gate: model-scored <40 never reaches the manual
         if via == "heuristic:irrelevant" {
             if let Some(tx) = &prog {
@@ -372,6 +437,65 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
         "dropped_irrelevant": dropped_irrelevant,
     });
     std::fs::write(dir.join("processed.json"), serde_json::to_string_pretty(&out).unwrap()).map_err(|e| MagpieError::Io(e.to_string()))?;
+    // synthesis pass: one clearly-marked generated intro per covered
+    // chapter (facts stay verbatim in entries; intros are connective tissue)
+    let mut intros: std::collections::HashMap<String, (String, String)> = Default::default();
+    {
+        let client2 = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().map_err(|e| MagpieError::Network(e.to_string()))?;
+        for ch in chapters.iter() {
+            let facts: Vec<String> = entries
+                .iter()
+                .filter(|e| &e.section == ch)
+                .flat_map(|e| e.bullets.iter().take(2).cloned())
+                .take(12)
+                .collect();
+            if facts.len() < 2 {
+                continue;
+            }
+            if let Some(tx) = &prog {
+                let _ = tx.send(format!("synthesizing {ch}…"));
+            }
+            let sys = "Write a short chapter introduction. Use ONLY the facts given. Reply ONLY JSON.";
+            let user = format!(
+                "{{\"manual\": \"{query}\", \"chapter\": \"{ch}\", \"facts\": {:?}, \"want\": {{\"intro\": \"150-250 word overview, no new facts\"}}}}",
+                facts
+            );
+            let body = serde_json::json!({
+                "messages": [{"role": "system", "content": sys}, {"role": "user", "content": user}],
+                "temperature": 0.3,
+                "max_tokens": 400,
+                "response_format": {"type": "json_object"},
+            });
+            let url = format!("{base}/v1/chat/completions", base = endpoint.trim_end_matches('/'));
+            let mut text = String::new();
+            if let Ok(Ok(r)) = tokio::time::timeout(std::time::Duration::from_secs(150), client2.post(&url).json(&body).send()).await {
+                if let Ok(Ok(t)) = tokio::time::timeout(std::time::Duration::from_secs(30), r.text()).await {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) {
+                        if let Some(s) = v["choices"][0]["message"]["content"].as_str() {
+                            if let Ok(j) = serde_json::from_str::<serde_json::Value>(s) {
+                                if let Some(i) = j.get("intro").and_then(|x| x.as_str()) {
+                                    text = i.chars().take(1500).collect();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !text.is_empty() {
+                intros.insert(ch.clone(), (text, format!("{via_tag}:synth")));
+            }
+        }
+    }
+    let out = serde_json::json!({
+        "query": query,
+        "title": format!("{query} — manual"),
+        "domain": domain,
+        "chapters": chapters,
+        "entries": entries,
+        "intros": intros.iter().map(|(k, (t, v))| (k.clone(), serde_json::json!({"text": t, "via": v}))).collect::<serde_json::Map<String, serde_json::Value>>(),
+        "dropped_irrelevant": dropped_irrelevant,
+    });
+    std::fs::write(dir.join("processed.json"), serde_json::to_string_pretty(&out).unwrap()).map_err(|e| MagpieError::Io(e.to_string()))?;
     if let Some(tx) = &prog {
         let _ = tx.send("rendering manual…".into());
     }
@@ -396,7 +520,7 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
         h.dedup();
         h
     };
-    crate::pdf::render_manual(&query, &chapters, &mentries, &hosts, &dir.join("manual.pdf"))?;
+    crate::pdf::render_manual(&query, &chapters, &intros, &mentries, &hosts, &dir.join("manual.pdf"))?;
     if let Some(tx) = &prog {
         let _ = tx.send("done".into());
     }

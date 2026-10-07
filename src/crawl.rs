@@ -340,7 +340,7 @@ pub fn chapter_queries(query: &str, domain: &str) -> Vec<String> {
 /// Internet Archive books: public-domain/open full text only.
 /// advancedsearch → metadata (confirm `_djvu.txt` exists) → download.
 /// Lending-library and restricted items never qualify — listed, never fetched.
-async fn ia_books(query: &str, prog: &Option<tokio::sync::mpsc::UnboundedSender<String>>) -> Vec<Page> {
+async fn ia_books(query: &str, prog: &Option<tokio::sync::mpsc::UnboundedSender<String>>, max_books: usize) -> Vec<Page> {
     let send = |m: &str| {
         if let Some(tx) = prog {
             let _ = tx.send(m.to_string());
@@ -363,7 +363,7 @@ async fn ia_books(query: &str, prog: &Option<tokio::sync::mpsc::UnboundedSender<
     let docs = v["response"]["docs"].as_array().cloned().unwrap_or_default();
     let mut out = vec![];
     for d in docs {
-        if out.len() >= 3 {
+        if out.len() >= max_books.max(1) {
             break;
         }
         let id = d.get("identifier").and_then(|x| x.as_str()).unwrap_or("").to_string();
@@ -380,9 +380,19 @@ async fn ia_books(query: &str, prog: &Option<tokio::sync::mpsc::UnboundedSender<
             continue;
         }
         let body = match c.get(&format!("https://archive.org/download/{id}/{id}_djvu.txt")).send().await {
-            Ok(r) => r.text().await.unwrap_or_default(),
+            Ok(r) => {
+                // restricted/lending items answer 403 with an error page —
+                // never ingest those as book text
+                if !r.status().is_success() {
+                    continue;
+                }
+                r.text().await.unwrap_or_default()
+            }
             Err(_) => continue,
         };
+        if body.contains("Page not found on Internet Archive") {
+            continue;
+        }
         // full text, not a sample: books are chunked downstream, and
         // runtime no longer matters more than coverage (cap ~400KB)
         let text: String = body.chars().take(400_000).collect();
@@ -391,14 +401,29 @@ async fn ia_books(query: &str, prog: &Option<tokio::sync::mpsc::UnboundedSender<
         }
         // content-density gate: the book must actually be ABOUT the query
         // (title matches lie — cf. poetry volumes). Count query-token hits.
+        // Plus a title-or-lead gate: error pages and passing mentions
+        // (a Texas document, Hong Kong newspapers) never qualify.
         let lt = text.to_lowercase();
-        let hits: usize = query
+        let toks: Vec<String> = query
             .to_lowercase()
             .split(|c: char| !c.is_ascii_alphanumeric())
             .filter(|t| t.len() > 2)
-            .map(|t| lt.matches(t).count())
-            .sum();
-        if hits < 4 {
+            .map(|t| t.to_string())
+            .collect();
+        let hits: usize = toks.iter().map(|t| lt.matches(&t[..]).count()).sum();
+        // title-or-lead gate: at least one query token in the title or
+        // the first 1500 chars (front matter). Passing mentions deep in
+        // a Texas file or a Hong Kong newspaper never qualify.
+        // A strong title match halves the bar, so non-English books
+        // (Portuguese cookbooks) survive on few English tokens.
+        let head: String = text.chars().take(1500).collect::<String>().to_lowercase();
+        let titled = title.to_lowercase();
+        let titled_hit = toks.iter().any(|t| titled.contains(&t[..]) || head.contains(&t[..]));
+        if !titled_hit {
+            continue;
+        }
+        let title_strong = toks.iter().any(|t| titled.contains(&t[..]));
+        if hits < if title_strong { 2 } else { 4 } {
             continue;
         }
         let chars = text.chars().count();
@@ -1167,6 +1192,20 @@ pub async fn plan_urls(
             }
         }
     }
+    // structured facts FIRST: cheap, reliable, and the instance line
+    // drives subject-domain detection for everything below (chapters,
+    // chapter books, variants)
+    send("search: wikidata…");
+    let mut instance_of = String::new();
+    if let Some((p, inst)) = wiki_data(query).await {
+        if !spam_url(&p.url) && seen.insert(canon_url(&p.url)) {
+            instance_of = inst;
+            prefetched.push(p);
+            send("search: wikidata got 1");
+        }
+    }
+    let domain = subject_domain(query, &instance_of);
+    send(&format!("outline: subject is {domain}"));
     if urls.len() < max_pages {
         send("search: verticals (site:)…");
         for u in site_scoped(query, &prog).await {
@@ -1190,13 +1229,29 @@ pub async fn plan_urls(
     // book + structured-drink legs: no search engine, no key.
     // IA/Wikisource/OpenLibrary are field-agnostic (sciences, art,
     // history); CocktailDB fires only when it has the drink.
+    // Books run per chapter too (a cookbook for Cuisine, not more history).
     {
         send("search: books (archive.org)…");
-        for p in ia_books(query, &prog).await {
+        for p in ia_books(query, &prog, 3).await {
             if spam_url(&p.url) || !seen.insert(canon_url(&p.url)) {
                 continue;
             }
             prefetched.push(p);
+        }
+        for ch in chapters(&domain) {
+            let first = ch.split_whitespace().next().unwrap_or("");
+            if first.is_empty() {
+                continue;
+            }
+            let bq = format!("{query} {first}");
+            send(&format!("search: books ({bq})…"));
+            for p in ia_books(&bq, &prog, 1).await {
+                if spam_url(&p.url) || !seen.insert(canon_url(&p.url)) {
+                    continue;
+                }
+                prefetched.push(p);
+                break;
+            }
         }
         send("search: wikisource…");
         for p in wikisource_search(query).await {
@@ -1290,20 +1345,7 @@ pub async fn plan_urls(
             }
         }
     }
-    // structured facts need no crawl: synthetic page straight into prefetch.
-    // Always fetched (cheap, reliable) — not gated on engine results.
-    // The instance line also drives subject-domain detection for chapters.
-    send("search: wikidata…");
-    let mut instance_of = String::new();
-    if let Some((p, inst)) = wiki_data(query).await {
-        if !spam_url(&p.url) && seen.insert(canon_url(&p.url)) {
-            instance_of = inst;
-            prefetched.push(p);
-            send("search: wikidata got 1");
-        }
-    }
-    let domain = subject_domain(query, &instance_of);
-    send(&format!("outline: subject is {domain}"));
+    // (wikidata + domain already resolved above, before books)
     if depth != "quick" && urls.len() < max_pages + 4 {
         let mut variants = chapter_queries(query, &domain);
         for a in alias_queries(query) {

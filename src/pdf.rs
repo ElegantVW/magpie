@@ -125,7 +125,7 @@ fn callout(doc: &mut Vec<Line>, label: &str, text: &str) {
 /// Chapters come from the producer outline (domain table); entries were
 /// filed into them by the pixie pass. Empty chapters render an explicit
 /// gap flag instead of vanishing silently.
-pub fn render_manual(query: &str, chapters: &[String], entries: &[ManualEntry], hosts: &[String], out: &std::path::Path) -> Result<()> {
+pub fn render_manual(query: &str, chapters: &[String], intros: &std::collections::HashMap<String, (String, String)>, entries: &[ManualEntry], hosts: &[String], out: &std::path::Path) -> Result<()> {
     // Pass 1: build content lines, record section start line index.
     let mut sec_no = 0usize;
     let mut doc: Vec<Line> = vec![];
@@ -134,6 +134,14 @@ pub fn render_manual(query: &str, chapters: &[String], entries: &[ManualEntry], 
         let group: Vec<&ManualEntry> = entries.iter().filter(|e| e.section == *ch).collect();
         sec_starts.push((ch.clone(), doc.len()));
         h1(&mut doc, &mut sec_no, ch);
+        // generated overview, explicitly marked — everything below it
+        // is verbatim-sourced
+        if let Some((intro, _)) = intros.get(ch) {
+            body(&mut doc, "Overview (generated connective text):");
+            for ln in wrap(intro, 95) {
+                doc.push(Line { text: format!("  {ln}"), size: 8.5, bold: false, units: 1 });
+            }
+        }
         if group.is_empty() {
             body(&mut doc, "— gap: no sources filed here —");
             continue;
