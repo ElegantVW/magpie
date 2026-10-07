@@ -91,10 +91,10 @@ async fn chat_once(client: &reqwest::Client, url: &str, body: &serde_json::Value
         .map_err(|e| format!("body:{e}"))
 }
 
-async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, chapters: &[String], query: &str, base: &str, title: &str, text: &str) -> (String, Vec<String>, Vec<[String; 2]>, Vec<String>, String, String) {
+async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, chapters: &[String], meaning: &str, query: &str, base: &str, title: &str, text: &str) -> (String, Vec<String>, Vec<[String; 2]>, Vec<String>, String, String) {
     let excerpt: String = text.chars().take(5000).collect();
     let chlist = chapters.join(" | ");
-    let sys = format!("You file web pages into a knowledge manual on '{query}'. Reply with ONLY a single JSON object, no other text. Quotes must be copied EXACTLY from the text, at most 90 characters each. Relevance scores whether the page is ABOUT '{query}' itself — never the chapter: a band called Portugal filed under Music & arts, a surname, a music mode sharing one word all score 0 even when the chapter seems to fit. File each page into exactly one chapter: {chlist}.");
+    let sys = format!("You file web pages into a knowledge manual on '{query}' ({meaning}). Reply with ONLY a single JSON object, no other text. Quotes must be copied EXACTLY from the text, at most 90 characters each. Relevance scores whether the page is ABOUT the subject itself — never the chapter, never derivation: something NAMED AFTER or DERIVED FROM the subject (a poetry movement named for obscurity, a band called Portugal, a surname) scores below 40 even when the chapter seems to fit. File each page into exactly one chapter: {chlist}.");
     let user = format!(
         "{{\"task\": \"classify\", \"title\": \"{title}\", \"url\": \"{base}\", \"text\": \"{excerpt}\", \"want\": {{\"kind\": \"spec|fault|review|dimensions|facts|howto|reference|history|other\", \"section\": \"one of: {chlist}\", \"bullets\": [\"up to 10 facts\"], \"specs\": [[\"key\", \"value\"] up to 12], \"quotes\": [\"up to 3 verbatim spans\"]}}}}"
     );
@@ -313,6 +313,17 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
         .to_string();
     let domain = crate::crawl::subject_domain(&query, &instance);
     let chapters = crate::crawl::chapters(&domain);
+    // meaning line from the stored query card (falls back to the query);
+    // the relevance prompt judges against meaning, never spelling
+    let meaning: String = v
+        .get("query_card")
+        .and_then(|c| c.get("meaning"))
+        .and_then(|m| m.as_str())
+        .filter(|m| !m.is_empty())
+        .unwrap_or(&query)
+        .chars()
+        .take(300)
+        .collect();
     // route inference through menagerie (house control plane): ensure the
     // magpie slot, resolve its URL. No raw-port assumptions.
     let app = llm_app();
@@ -389,7 +400,7 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
         if let Some(tx) = &prog {
             let _ = tx.send(format!("pixie {}/{} {}", n + 1, kept_total, url.chars().take(50).collect::<String>()));
         }
-        let (kind, bullets, specs, quotes, section, via) = process_one(&client, &endpoint, &via_tag, &chapters, &query, &url, &title, &text).await;
+        let (kind, bullets, specs, quotes, section, via) = process_one(&client, &endpoint, &via_tag, &chapters, &meaning, &query, &url, &title, &text).await;
         // namesake filter: parenthetical disambiguators that never belong
         // in a subject manual (bands, surnames, albums share query words)
         let tl = title.to_lowercase();

@@ -19,11 +19,128 @@ pub struct Page {
 }
 
 fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .user_agent(UA)
-        .timeout(Duration::from_secs(12))
-        .build()
-        .expect("client")
+    use std::sync::OnceLock;
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .user_agent(UA)
+                .timeout(Duration::from_secs(12))
+                .build()
+                .expect("client")
+        })
+        .clone()
+}
+
+/// Query card: what the query MEANS, before any searching.
+/// Wikidata (label + description + aliases + instance) and Wiktionary
+/// (definitions per sense) — both keyless. Every downstream gate and the
+/// relevance scorer work from this card, not from raw spelling.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct QueryCard {
+    pub subject: String,
+    pub meaning: String,
+    pub aliases: Vec<String>,
+    pub instance: String,
+}
+
+pub async fn query_card(query: &str) -> QueryCard {
+    let c = client();
+    let mut card = QueryCard { subject: query.to_string(), ..Default::default() };
+    // wikidata entity: label, description, aliases, instance
+    if let Ok(s) = c
+        .get(&format!(
+            "https://www.wikidata.org/w/api.php?action=wbsearchentities&search={}&language=en&format=json&limit=1",
+            url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>()
+        ))
+        .send()
+        .await
+    {
+        if let Ok(t) = s.text().await {
+            if let Some(id) = Regex::new(r#""id":"(Q\d+)""#)
+                .unwrap()
+                .captures(&t)
+                .map(|c| c[1].to_string())
+            {
+                let url = format!("https://www.wikidata.org/w/api.php?action=wbgetentities&ids={id}&props=labels%7Cdescriptions%7Caliases%7Cclaims&languages=en&format=json");
+                if let Ok(r) = c.get(&url).send().await {
+                    if let Ok(t) = r.text().await {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) {
+                            if let Some(e) = v.get("entities").and_then(|e| e.get(&id)) {
+                                let pick = |o: Option<&str>| o.unwrap_or("").to_string();
+                                card.subject = pick(e.get("labels").and_then(|l| l.get("en")).and_then(|l| l.get("value")).and_then(|x| x.as_str()));
+                                if card.subject.is_empty() {
+                                    card.subject = query.to_string();
+                                }
+                                card.meaning = pick(e.get("descriptions").and_then(|l| l.get("en")).and_then(|l| l.get("value")).and_then(|x| x.as_str()));
+                                if let Some(arr) = e.get("aliases").and_then(|a| a.get("en")).and_then(|a| a.as_array()) {
+                                    for a in arr.iter().take(8) {
+                                        if let Some(s) = a.get("value").and_then(|x| x.as_str()) {
+                                            if !s.is_empty() {
+                                                card.aliases.push(s.to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                                // instance line for domain detection
+                                if let Some(arr) = e.get("claims").and_then(|c| c.get("P31")).and_then(|s| s.as_array()) {
+                                    let mut inst = vec![];
+                                    for st in arr.iter().take(3) {
+                                        if let Some(q) = st.get("mainsnak").and_then(|m| m.get("datavalue")).and_then(|d| d.get("value")).and_then(|x| x.get("id")).and_then(|x| x.as_str()) {
+                                            inst.push(q.to_string());
+                                        }
+                                    }
+                                    card.instance = inst.join(",");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // wiktionary: definitions per sense for single-word queries
+    if query.split_whitespace().count() == 1 {
+        let url = format!(
+            "https://en.wiktionary.org/w/api.php?action=query&prop=extracts&explaintext=1&titles={}&format=json",
+            url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>()
+        );
+        if let Ok(r) = c.get(&url).send().await {
+            if let Ok(t) = r.text().await {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) {
+                    if let Some(pages) = v.get("query").and_then(|q| q.get("pages")).and_then(|p| p.as_object()) {
+                        for (_, p) in pages {
+                            if let Some(x) = p.get("extract").and_then(|e| e.as_str()) {
+                                // definitions only: drop ==section== headers and
+                                // stray separators leaking from the extract
+                                let def: String = x
+                                    .split('\n')
+                                    .map(|l| l.trim())
+                                    .filter(|l| {
+                                        !l.is_empty()
+                                            && !(l.starts_with("==") && l.ends_with("=="))
+                                            && *l != "/"
+                                    })
+                                    .take(4)
+                                    .collect::<Vec<_>>()
+                                    .join(" / ")
+                                    .chars()
+                                    .take(400)
+                                    .collect();
+                                if !def.is_empty() {
+                                    if !card.meaning.is_empty() {
+                                        card.meaning.push_str(" | ");
+                                    }
+                                    card.meaning.push_str(&def);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    card
 }
 
 fn clean_ws(s: &str) -> String {
@@ -32,11 +149,19 @@ fn clean_ws(s: &str) -> String {
 }
 
 fn strip_tags(html: &str) -> String {
-    // preserve structure: block elements -> newlines before stripping
+    // readability-lite: drop chrome elements wholesale (nav, menus,
+    // footers pollute every page and dilute both Jaccard and LLM context),
+    // then keep only dense blocks. (No backrefs: the regex crate forbids
+    // them, so one pattern per element.)
+    let mut t = html.to_string();
+    for tag in ["header", "nav", "footer", "aside", "form", "menu", "noscript", "svg", "iframe"] {
+        let pat = format!(r"(?is)<{tag}[^>]*>.*?</{tag}>");
+        t = Regex::new(&pat).unwrap().replace_all(&t, " ").to_string();
+    }
     let re_script = Regex::new(r"(?is)<script.*?</script>").unwrap();
     let re_style = Regex::new(r"(?is)<style.*?</style>").unwrap();
-    let re_block = Regex::new(r"(?is)</?(p|div|br|tr|li|h1|h2|h3|h4|table)[^>]*>").unwrap();
-    let t = re_script.replace_all(html, " ");
+    let re_block = Regex::new(r"(?is)</?(p|div|br|tr|li|h1|h2|h3|h4|table|article|section)[^>]*>").unwrap();
+    let t = re_script.replace_all(&t, " ");
     let t = re_style.replace_all(&t, " ");
     let t = re_block.replace_all(&t, "\n");
     let re_tags = Regex::new(r"(?s)<[^>]+>").unwrap();
@@ -47,7 +172,14 @@ fn strip_tags(html: &str) -> String {
     decoded
         .split('\n')
         .map(|l| ws.replace_all(l.trim(), " ").to_string())
-        .filter(|l| !l.is_empty())
+        .filter(|l| {
+            if l.is_empty() {
+                return false;
+            }
+            let words = l.split_whitespace().count();
+            // dense prose passes; short headings pass unless menu-like
+            words >= 8 || (l.len() < 120 && words >= 3 && !l.contains('|'))
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -371,15 +503,34 @@ async fn ia_books(query: &str, prog: &Option<tokio::sync::mpsc::UnboundedSender<
         if id.is_empty() {
             continue;
         }
-        // metadata: only proceed with a real full-text file present
+        // metadata: only proceed with a real full-text file present.
+        // NOTE: newer items name files by title, not identifier —
+        // resolve the exact _djvu.txt from the file list, never guess.
         let meta = match c.get(&format!("https://archive.org/metadata/{id}")).send().await {
             Ok(r) => r.text().await.unwrap_or_default(),
             Err(_) => continue,
         };
-        if !meta.contains("_djvu.txt") {
-            continue;
-        }
-        let body = match c.get(&format!("https://archive.org/download/{id}/{id}_djvu.txt")).send().await {
+        let txt_name: Option<String> = (|| {
+            let v: serde_json::Value = serde_json::from_str(&meta).ok()?;
+            let mut cands: Vec<String> = vec![];
+            for f in v.get("files")?.as_array()? {
+                let n = f.get("name")?.as_str()?;
+                if n.ends_with("_djvu.txt") {
+                    cands.push(n.to_string());
+                }
+            }
+            // prefer the identifier-stemmed file, else first candidate
+            cands
+                .iter()
+                .find(|n| n.starts_with(&id))
+                .cloned()
+                .or_else(|| cands.into_iter().next())
+        })();
+        let txt_name = match txt_name {
+            Some(n) => n,
+            None => continue,
+        };
+        let body = match c.get(&format!("https://archive.org/download/{id}/{txt_name}")).send().await {
             Ok(r) => {
                 // restricted/lending items answer 403 with an error page —
                 // never ingest those as book text
@@ -400,9 +551,18 @@ async fn ia_books(query: &str, prog: &Option<tokio::sync::mpsc::UnboundedSender<
             continue;
         }
         // content-density gate: the book must actually be ABOUT the query
-        // (title matches lie — cf. poetry volumes). Count query-token hits.
-        // Plus a title-or-lead gate: error pages and passing mentions
-        // (a Texas document, Hong Kong newspapers) never qualify.
+        // (title matches lie — cf. poetry volumes). Stemmed: "hermeticism"
+        // must match "hermetic philosophy" (Kybalion class of misses).
+        let stem = |t: &str| -> String {
+            let mut s = t.to_string();
+            for suf in ["icism", "ism", "ists", "ist", "tion", "ing", "ed", "es", "s"] {
+                if s.len() > suf.len() + 3 && s.ends_with(suf) {
+                    s.truncate(s.len() - suf.len());
+                    break;
+                }
+            }
+            s
+        };
         let lt = text.to_lowercase();
         let toks: Vec<String> = query
             .to_lowercase()
@@ -410,7 +570,12 @@ async fn ia_books(query: &str, prog: &Option<tokio::sync::mpsc::UnboundedSender<
             .filter(|t| t.len() > 2)
             .map(|t| t.to_string())
             .collect();
-        let hits: usize = toks.iter().map(|t| lt.matches(&t[..]).count()).sum();
+        let stems: Vec<String> = toks.iter().map(|t| stem(t)).collect();
+        let hits: usize = toks
+            .iter()
+            .chain(stems.iter())
+            .map(|t| lt.matches(&t[..]).count())
+            .sum();
         // title-or-lead gate: at least one query token in the title or
         // the first 1500 chars (front matter). Passing mentions deep in
         // a Texas file or a Hong Kong newspaper never qualify.
@@ -418,11 +583,12 @@ async fn ia_books(query: &str, prog: &Option<tokio::sync::mpsc::UnboundedSender<
         // (Portuguese cookbooks) survive on few English tokens.
         let head: String = text.chars().take(1500).collect::<String>().to_lowercase();
         let titled = title.to_lowercase();
-        let titled_hit = toks.iter().any(|t| titled.contains(&t[..]) || head.contains(&t[..]));
+        let all: Vec<&String> = toks.iter().chain(stems.iter()).collect();
+        let titled_hit = all.iter().any(|t| titled.contains(&t[..]) || head.contains(&t[..]));
         if !titled_hit {
             continue;
         }
-        let title_strong = toks.iter().any(|t| titled.contains(&t[..]));
+        let title_strong = all.iter().any(|t| titled.contains(&t[..]));
         if hits < if title_strong { 2 } else { 4 } {
             continue;
         }
@@ -1076,6 +1242,11 @@ pub struct CrawlPlan {
     /// content already fetched from bulk legs (WARC, structured APIs)
     #[serde(default)]
     pub prefetched: Vec<Page>,
+    /// per-leg yield for the log: (leg, urls-or-pages contributed)
+    #[serde(default)]
+    pub legs: Vec<(String, usize)>,
+    /// what the query means (drives gates + relevance downstream)
+    pub query_card: QueryCard,
 }
 
 /// Build thorough URL list: DDG + Marginalia + Wikipedia titles.
@@ -1098,6 +1269,25 @@ pub async fn plan_urls(
     let mut urls: Vec<String> = vec![];
     let mut prefetched: Vec<Page> = vec![];
     let mut seen = HashSet::new();
+    let mut legs: Vec<(String, usize)> = vec![];
+
+    // query card FIRST: meaning + aliases drive every gate below.
+    // Understanding precedes searching.
+    send("understand: query card…");
+    let card = query_card(query).await;
+    if card.meaning.is_empty() && card.aliases.is_empty() {
+        send("understand: no card (offline?) — raw spelling only");
+    } else {
+        send(&format!(
+            "understand: {} — {} [aliases: {}]",
+            card.subject,
+            card.meaning.chars().take(100).collect::<String>(),
+            card.aliases.join(", ").chars().take(80).collect::<String>()
+        ));
+    }
+    // expanded lexicon: query terms + aliases feed the gates
+    // (cross-badge misses die here, not in the manual)
+    let gate_q = format!("{} {}", query, card.aliases.join(" "));
 
     send("search: duckduckgo…");
     let ddg = match tokio::time::timeout(std::time::Duration::from_secs(20), ddg_search(query, per_engine)).await {
@@ -1119,8 +1309,9 @@ pub async fn plan_urls(
     send(&format!("search: marginalia got {}", mar.len()));
 
     let mut raw: Vec<String> = ddg.into_iter().chain(mar).collect();
-    // relevance gate for unscoped engine hits (wikipedia/verticals exempt)
-    let gated: Vec<String> = raw.drain(..).filter(|u| !spam_url(u) && model_gate(query, u)).collect();
+    // relevance gate on the EXPANDED lexicon (wikipedia/verticals exempt)
+    let gated: Vec<String> = raw.drain(..).filter(|u| !spam_url(u) && model_gate(&gate_q, u)).collect();
+    legs.push(("engines".into(), gated.len()));
     let chosen: Vec<String> = if gated.len() >= 3 {
         gated
     } else {
@@ -1166,6 +1357,7 @@ pub async fn plan_urls(
             }
         }
         send(&format!("search: wikipedia got {n}"));
+        legs.push(("wikipedia".into(), n));
         // legacy en API as backup when opensearch yields little
         if n < 2 {
             match tokio::time::timeout(std::time::Duration::from_secs(15), fetch_one(&wikipedia_api(query))).await {
@@ -1196,6 +1388,7 @@ pub async fn plan_urls(
     // drives subject-domain detection for everything below (chapters,
     // chapter books, variants)
     send("search: wikidata…");
+    let wmark = prefetched.len();
     let mut instance_of = String::new();
     if let Some((p, inst)) = wiki_data(query).await {
         if !spam_url(&p.url) && seen.insert(canon_url(&p.url)) {
@@ -1206,15 +1399,17 @@ pub async fn plan_urls(
     }
     let domain = subject_domain(query, &instance_of);
     send(&format!("outline: subject is {domain}"));
+    legs.push(("wikidata".into(), prefetched.len() - wmark));
     if urls.len() < max_pages {
         send("search: verticals (site:)…");
+        let mark = urls.len();
         for u in site_scoped(query, &prog).await {
             if spam_url(&u) {
                 continue;
             }
             // verticals are pre-scoped by site: but engines may ignore the
-            // operator — still gate on the model token
-            if !model_gate(query, &u) {
+            // operator — still gate on the expanded lexicon
+            if !model_gate(&gate_q, &u) {
                 continue;
             }
             if !seen.insert(canon_url(&u)) {
@@ -1225,12 +1420,14 @@ pub async fn plan_urls(
                 break;
             }
         }
+        legs.push(("site-verticals".into(), urls.len() - mark));
     }
     // book + structured-drink legs: no search engine, no key.
     // IA/Wikisource/OpenLibrary are field-agnostic (sciences, art,
     // history); CocktailDB fires only when it has the drink.
     // Books run per chapter too (a cookbook for Cuisine, not more history).
     {
+        let mark = prefetched.len();
         send("search: books (archive.org)…");
         for p in ia_books(query, &prog, 3).await {
             if spam_url(&p.url) || !seen.insert(canon_url(&p.url)) {
@@ -1282,11 +1479,13 @@ pub async fn plan_urls(
                 break;
             }
         }
+        legs.push(("books".into(), prefetched.len() - mark));
     }
     // entity traversal: top wikidata entities seed their articles
     // ("mixology" -> Cocktail, Bartender, List of cocktails…)
     if urls.len() < max_pages + 4 {
         send("search: wikidata related…");
+        let mark = urls.len();
         for u in wiki_related(query).await {
             if spam_url(&u) || !seen.insert(canon_url(&u)) {
                 continue;
@@ -1296,9 +1495,12 @@ pub async fn plan_urls(
                 break;
             }
         }
+        legs.push(("related".into(), urls.len() - mark));
     }
     // bulk legs: sitemaps + Common Crawl on hosts already seen (no search engine)
     if urls.len() < max_pages {
+        let mark = urls.len();
+        let pmark = prefetched.len();
         use std::collections::HashSet as _Hs2;
         let mut hosts: Vec<String> = vec![];
         let mut _hs = _Hs2::new();
@@ -1344,6 +1546,7 @@ pub async fn plan_urls(
                 prefetched.push(p);
             }
         }
+        legs.push(("bulk".into(), (urls.len() - mark) + (prefetched.len() - pmark)));
     }
     // (wikidata + domain already resolved above, before books)
     if depth != "quick" && urls.len() < max_pages + 4 {
@@ -1375,7 +1578,7 @@ pub async fn plan_urls(
                 if spam_url(&u) {
                     continue;
                 }
-                if !model_gate(&variant, &u) && !model_gate(query, &u) {
+                if !model_gate(&variant, &u) && !model_gate(&gate_q, &u) {
                     continue;
                 }
                 if !seen.insert(canon_url(&u)) {
@@ -1403,6 +1606,7 @@ pub async fn plan_urls(
             }
             round += 1;
         }
+        legs.push(("variants".into(), buckets.iter().map(|b| b.len()).sum()));
     }
     // global encyclopedia cap: exempt legs (family, sitelinks, harvest)
     // can otherwise flood single-token queries with surnames and bands
@@ -1416,42 +1620,116 @@ pub async fn plan_urls(
         true
     });
     urls.truncate(max_pages);
-    CrawlPlan { urls, prefetched }
+    CrawlPlan { urls, prefetched, legs, query_card: card }
 }
 
-pub async fn crawl_urls(urls: &[String], prog: Option<tokio::sync::mpsc::UnboundedSender<String>>) -> Vec<Page> {
-    let mut out = vec![];
-    let total = urls.len();
-    for (i, u) in urls.iter().enumerate() {
-        if let Some(tx) = &prog {
-            let host = url::Url::parse(u)
-                .map(|p| p.host_str().unwrap_or("").to_string())
-                .unwrap_or_else(|_| u.chars().take(40).collect());
-            let _ = tx.send(format!("fetch {}/{} {}", i + 1, total, host));
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        match fetch_one(u).await {
-            Ok(p) => {
-                if p.text.chars().count() < 200 {
-                    if let Some(tx) = &prog {
-                        let _ = tx.send(format!("skip {}/{} (thin)", i + 1, total));
-                    }
-                    continue;
-                }
-                if let Some(tx) = &prog {
-                    let _ = tx.send(format!("got {}/{} {}c", i + 1, total, p.chars));
-                }
-                out.push(p);
-            }
-            Err(_) => {
-                if let Some(tx) = &prog {
-                    let _ = tx.send(format!("fail {}/{}", i + 1, total));
-                }
-                continue;
+/// robots.txt, cached per host: best-effort Disallow check.
+/// House citizenship: magpie is privacy-first AND polite.
+async fn robots_allows(url: &str) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
+    let host = match url::Url::parse(url).ok().and_then(|p| p.host_str().map(|h| h.to_string())) {
+        Some(h) => h,
+        None => return true,
+    };
+    let path = url::Url::parse(url).map(|p| p.path().to_string()).unwrap_or_else(|_| "/".into());
+    {
+        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Ok(c) = cache.lock() {
+            if let Some(rules) = c.get(&host) {
+                return !rules.iter().any(|d: &String| path.starts_with(d));
             }
         }
     }
-    out
+    // fetch once per host (short timeout; failure = allow)
+    let body = {
+        let c = client();
+        match tokio::time::timeout(std::time::Duration::from_secs(8), c.get(&format!("https://{host}/robots.txt")).send()).await {
+            Ok(Ok(r)) => r.text().await.unwrap_or_default(),
+            _ => String::new(),
+        }
+    };
+    let mut in_wildcard = false;
+    let mut rules: Vec<String> = vec![];
+    for line in body.lines() {
+        let l = line.trim();
+        if l.to_lowercase().starts_with("user-agent:") {
+            let ua = l[11..].trim();
+            in_wildcard = ua == "*" || ua.to_lowercase().contains("magpie");
+        } else if in_wildcard && l.to_lowercase().starts_with("disallow:") {
+            let d = l[9..].trim().to_string();
+            if !d.is_empty() {
+                rules.push(d);
+            }
+        }
+    }
+    let ok = !rules.iter().any(|d| path.starts_with(d));
+    if let Ok(mut c) = CACHE.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+        c.insert(host, rules);
+    }
+    ok
+}
+
+pub async fn crawl_urls(urls: &[String], prog: Option<tokio::sync::mpsc::UnboundedSender<String>>) -> Vec<Page> {
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
+    // 3 concurrent fetches, 250ms launch pacing: fast but polite.
+    // (Was serial 400ms; time no longer matters more than coverage,
+    // but citizenship still does.)
+    let total = urls.len();
+    let sem = Arc::new(Semaphore::new(3));
+    let mut handles = vec![];
+    for (i, u) in urls.iter().cloned().enumerate() {
+        let prog = prog.clone();
+        let sem = sem.clone();
+        handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire_owned().await;
+            if let Some(tx) = &prog {
+                let host = url::Url::parse(&u)
+                    .map(|p| p.host_str().unwrap_or("").to_string())
+                    .unwrap_or_else(|_| u.chars().take(40).collect());
+                let _ = tx.send(format!("fetch {}/{} {}", i + 1, total, host));
+            }
+            if !robots_allows(&u).await {
+                if let Some(tx) = &prog {
+                    let _ = tx.send(format!("skip {}/{} (robots)", i + 1, total));
+                }
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            match fetch_one(&u).await {
+                Ok(p) => {
+                    if p.text.chars().count() < 200 {
+                        if let Some(tx) = &prog {
+                            let _ = tx.send(format!("skip {}/{} (thin)", i + 1, total));
+                        }
+                        return None;
+                    }
+                    if let Some(tx) = &prog {
+                        let _ = tx.send(format!("got {}/{} {}c", i + 1, total, p.chars));
+                    }
+                    Some((i, p))
+                }
+                Err(_) => {
+                    if let Some(tx) = &prog {
+                        let _ = tx.send(format!("fail {}/{}", i + 1, total));
+                    }
+                    None
+                }
+            }
+        }));
+    }
+    let mut out: Vec<(usize, Page)> = vec![];
+    for h in handles {
+        if let Ok(Some(p)) = h.await {
+            out.push(p);
+        }
+    }
+    // restore plan order (progress may arrive out of order; order matters
+    // for dup_of indices and ring-budget expectations)
+    out.sort_by_key(|(i, _)| *i);
+    out.into_iter().map(|(_, p)| p).collect()
 }
 
 fn host_of(u: &str) -> String {

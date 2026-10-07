@@ -1,4 +1,4 @@
-use crate::crawl::{crawl_urls, expand_second_hop, plan_urls, Page};
+use crate::crawl::{crawl_urls, expand_second_hop, plan_urls, Page, QueryCard};
 use crate::error::{MagpieError, Result};
 use crate::pdf::render_pdf;
 use crate::store::seek_dir;
@@ -9,6 +9,8 @@ pub struct SeekDoc {
     pub query: String,
     pub depth: String,
     pub created: String,
+    pub query_card: QueryCard,
+    pub legs: Vec<(String, usize)>,
     pub pages: Vec<Page>,
     pub hosts: Vec<String>,
     pub warnings: Vec<String>,
@@ -244,6 +246,8 @@ pub async fn run_seek_with_progress(
         query: query.clone(),
         depth: depth.clone(),
         created: chrono::Utc::now().to_rfc3339(),
+        query_card: plan.query_card.clone(),
+        legs: plan.legs.clone(),
         pages,
         hosts,
         warnings,
@@ -278,13 +282,27 @@ pub async fn run_seek_with_progress(
         render_pdf(&doc.query, &doc.pages, &doc.hosts, &pdf_path)?;
     }
 
-    // evidence log for hung/stall diagnosis
+    // evidence log: per-leg yields answer "where are the books" in one cat
+    let legs_line = doc
+        .legs
+        .iter()
+        .map(|(l, n)| format!("{l}={n}"))
+        .collect::<Vec<_>>()
+        .join(" ");
     let _ = std::fs::write(
         dir.join("seek.log"),
         format!(
-            "query={}\ndepth={}\ncreated={}\npages={} hosts={:?}\nwarnings={:?}\n",
-            doc.query, doc.depth, doc.created,
-            doc.pages.len(), doc.hosts, doc.warnings
+            "query={}\ndepth={}\ncreated={}\ncard={} | {} | aliases={:?}\nlegs: {}\npages={} hosts={:?}\nwarnings={:?}\n",
+            doc.query,
+            doc.depth,
+            doc.created,
+            doc.query_card.subject,
+            doc.query_card.meaning.chars().take(120).collect::<String>(),
+            doc.query_card.aliases,
+            legs_line,
+            doc.pages.len(),
+            doc.hosts,
+            doc.warnings
         ),
     );
 
