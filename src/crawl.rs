@@ -32,6 +32,79 @@ fn client() -> reqwest::Client {
         .clone()
 }
 
+/// Subject lexicon: query + card subject + aliases, stemmed. Every book
+/// and chunk gate works from THESE tokens — never from chapter-augmented
+/// search strings ("hermeticism History" must not let a book through on
+/// the word "history" alone). That was the Politica Aeterna hole: a Dugin
+/// volume matched "history" in front matter and rode the History chapter
+/// into 24 keeper slots.
+pub fn subject_lexicon(query: &str, card: &QueryCard) -> Vec<String> {
+    let stem = |t: &str| -> String {
+        let mut s = t.to_string();
+        for suf in ["icism", "ism", "ists", "ist", "tion", "ing", "ed", "es", "s"] {
+            if s.len() > suf.len() + 3 && s.ends_with(suf) {
+                s.truncate(s.len() - suf.len());
+                break;
+            }
+        }
+        s
+    };
+    let mut set: std::collections::HashSet<String> = Default::default();
+    let mut feed = |s: &str| {
+        for tok in s.to_lowercase().split(|c: char| !c.is_ascii_alphanumeric()).filter(|t| t.len() > 2) {
+            set.insert(tok.to_string());
+            let st = stem(tok);
+            if st.len() > 2 {
+                set.insert(st);
+            }
+        }
+    };
+    feed(query);
+    feed(&card.subject);
+    for a in &card.aliases {
+        feed(a);
+    }
+    // proper nouns from the meaning line (central figures): intake matching
+    // must know Hermes Trismegistus belongs to Hermeticism. Only
+    // capitalized words longer than 3 chars, minus sentence-initial
+    // stopwords ("From hermetic +…" would otherwise admit every book on
+    // the word "from") and short all-caps abbreviations ("IPA" from the
+    // pronunciation guide is not a person).
+    const STOP: &[&str] = &[
+        "from", "with", "and", "the", "for", "that", "this", "are", "was", "were", "have", "has",
+        "which", "their", "been", "also", "into", "such", "than", "then", "them", "when", "where",
+        "what", "there", "these", "those", "will", "would", "about", "after", "before", "between",
+    ];
+    for tok in card.meaning.split(|c: char| !c.is_ascii_alphanumeric()).filter(|t| t.len() > 3) {
+        if !tok.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+            continue;
+        }
+        if tok.chars().all(|c| c.is_ascii_uppercase()) {
+            continue;
+        }
+        if STOP.contains(&tok.to_lowercase().as_str()) {
+            continue;
+        }
+        set.insert(tok.to_lowercase());
+    }
+    let mut out: Vec<String> = set.into_iter().collect();
+    out.sort();
+    out
+}
+
+/// Book-level intake: the whole work must be ABOUT the subject. Title or
+/// front matter must name it, and the full text must mention it densely.
+/// One passing mention deep in an unrelated volume never qualifies.
+fn book_about_subject(title: &str, head: &str, text_lt: &str, lex: &[String]) -> bool {
+    let titled = title.to_lowercase();
+    if !lex.iter().any(|t| titled.contains(&t[..]) || head.contains(&t[..])) {
+        return false;
+    }
+    let hits: usize = lex.iter().map(|t| text_lt.matches(&t[..]).count()).sum();
+    // good books mention the subject 50+ times; passing mentions score <8
+    hits >= 8
+}
+
 /// Query card: what the query MEANS, before any searching.
 /// Wikidata (label + description + aliases + instance) and Wiktionary
 /// (definitions per sense) — both keyless. Every downstream gate and the
@@ -478,7 +551,9 @@ pub fn chapter_queries(query: &str, domain: &str) -> Vec<String> {
 /// Internet Archive books: public-domain/open full text only.
 /// advancedsearch → metadata (confirm `_djvu.txt` exists) → download.
 /// Lending-library and restricted items never qualify — listed, never fetched.
-async fn ia_books(query: &str, prog: &Option<tokio::sync::mpsc::UnboundedSender<String>>, max_books: usize) -> Vec<Page> {
+/// `search_q` is the IA query (may be chapter-augmented); gating always uses
+/// the SUBJECT lexicon (original query + card), never the augmented string.
+async fn ia_books(search_q: &str, subject_q: &str, card: &QueryCard, prog: &Option<tokio::sync::mpsc::UnboundedSender<String>>, max_books: usize) -> Vec<Page> {
     let send = |m: &str| {
         if let Some(tx) = prog {
             let _ = tx.send(m.to_string());
@@ -488,7 +563,7 @@ async fn ia_books(query: &str, prog: &Option<tokio::sync::mpsc::UnboundedSender<
     let c = client();
     let q = format!(
         "https://archive.org/advancedsearch.php?q={}+AND+mediatype%3Atexts&fl%5B%5D=identifier&fl%5B%5D=title&fl%5B%5D=year&rows=12&output=json",
-        url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>()
+        url::form_urlencoded::byte_serialize(search_q.as_bytes()).collect::<String>()
     );
     let txt = match c.get(&q).send().await {
         Ok(r) => r.text().await.unwrap_or_default(),
@@ -556,46 +631,16 @@ async fn ia_books(query: &str, prog: &Option<tokio::sync::mpsc::UnboundedSender<
         if text.chars().count() < 2000 {
             continue;
         }
-        // content-density gate: the book must actually be ABOUT the query
-        // (title matches lie — cf. poetry volumes). Stemmed: "hermeticism"
-        // must match "hermetic philosophy" (Kybalion class of misses).
-        let stem = |t: &str| -> String {
-            let mut s = t.to_string();
-            for suf in ["icism", "ism", "ists", "ist", "tion", "ing", "ed", "es", "s"] {
-                if s.len() > suf.len() + 3 && s.ends_with(suf) {
-                    s.truncate(s.len() - suf.len());
-                    break;
-                }
-            }
-            s
-        };
+        // intake gate: the whole work must be ABOUT the subject (title or
+        // front matter names it, full text mentions it densely). Gated on
+        // the SUBJECT lexicon — chapter-augmented search words never count.
+        // (Politica Aeterna rode "history" in; poetry volumes ride title
+        // substrings. Both classes die here now.)
+        let lex = subject_lexicon(subject_q, card);
         let lt = text.to_lowercase();
-        let toks: Vec<String> = query
-            .to_lowercase()
-            .split(|c: char| !c.is_ascii_alphanumeric())
-            .filter(|t| t.len() > 2)
-            .map(|t| t.to_string())
-            .collect();
-        let stems: Vec<String> = toks.iter().map(|t| stem(t)).collect();
-        let hits: usize = toks
-            .iter()
-            .chain(stems.iter())
-            .map(|t| lt.matches(&t[..]).count())
-            .sum();
-        // title-or-lead gate: at least one query token in the title or
-        // the first 1500 chars (front matter). Passing mentions deep in
-        // a Texas file or a Hong Kong newspaper never qualify.
-        // A strong title match halves the bar, so non-English books
-        // (Portuguese cookbooks) survive on few English tokens.
         let head: String = text.chars().take(1500).collect::<String>().to_lowercase();
-        let titled = title.to_lowercase();
-        let all: Vec<&String> = toks.iter().chain(stems.iter()).collect();
-        let titled_hit = all.iter().any(|t| titled.contains(&t[..]) || head.contains(&t[..]));
-        if !titled_hit {
-            continue;
-        }
-        let title_strong = all.iter().any(|t| titled.contains(&t[..]));
-        if hits < if title_strong { 2 } else { 4 } {
+        if !book_about_subject(&title, &head, &lt, &lex) {
+            send(&format!("search: archive.org skip {title} (off-subject)"));
             continue;
         }
         let chars = text.chars().count();
@@ -1591,7 +1636,7 @@ pub async fn plan_urls(
     {
         let mark = prefetched.len();
         send("search: books (archive.org)…");
-        for p in ia_books(query, &prog, 3).await {
+        for p in ia_books(query, query, &card, &prog, 3).await {
             if spam_url(&p.url) || !seen.insert(canon_url(&p.url)) {
                 continue;
             }
@@ -1604,7 +1649,7 @@ pub async fn plan_urls(
             }
             let bq = format!("{query} {first}");
             send(&format!("search: books ({bq})…"));
-            for p in ia_books(&bq, &prog, 1).await {
+            for p in ia_books(&bq, query, &card, &prog, 1).await {
                 if spam_url(&p.url) || !seen.insert(canon_url(&p.url)) {
                     continue;
                 }
@@ -2100,4 +2145,52 @@ async fn fetch_raw(url: &str) -> std::result::Result<String, ()> {
         return Err(());
     }
     r.text().await.map_err(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{book_about_subject, subject_lexicon, QueryCard};
+
+    fn herm_card() -> QueryCard {
+        QueryCard {
+            subject: "Hermeticism".into(),
+            meaning: "philosophical and religious tradition based primarily upon writings attributed to Hermes Trismegistus".into(),
+            aliases: vec!["Hermetism".into(), "hermetism".into()],
+            instance: String::new(),
+        }
+    }
+
+    #[test]
+    fn dugin_rides_history_no_more() {
+        // the Politica Aeterna hole: title + front matter name everything
+        // except the subject; "history" alone must not admit it
+        let lex = subject_lexicon("hermeticism", &herm_card());
+        // stemmer strips -icism first: "hermeticism" -> "hermet", which
+        // still matches "hermetic"/"hermeticism" as a substring (right
+        // direction: short lex token inside longer text words)
+        assert!(lex.iter().any(|t| t == "hermet"), "lexicon lost the stem: {lex:?}");
+        // sentence-initial stopwords and pronunciation guides are not names
+        assert!(!lex.iter().any(|t| t == "from"), "stopword leaked: {lex:?}");
+        assert!(!lex.iter().any(|t| t == "ipa"), "abbreviation leaked: {lex:?}");
+        let head = "politica aeterna alexandr dugin history of political philosophy ".to_string();
+        let text = "history ".repeat(50) + &"hermeticism ".repeat(2);
+        assert!(
+            !book_about_subject("Politica Aeterna (Alexandr Dugin) — Internet Archive", &head, &text.to_lowercase(), &lex),
+            "off-subject volume admitted"
+        );
+    }
+
+    #[test]
+    fn canon_passes_intake() {
+        // central figures count: a chunk naming Hermes but never the
+        // -ism still belongs to the subject
+        let lex = subject_lexicon("hermeticism", &herm_card());
+        assert!(lex.iter().any(|t| t == "hermes"), "lexicon lost the figure: {lex:?}");        let lex = subject_lexicon("hermeticism", &herm_card());
+        let head = "the corpus hermeticum attributed to hermes trismegistus ".to_string();
+        let text = "hermeticism ".repeat(30) + &"hermes trismegistus ".repeat(20);
+        assert!(
+            book_about_subject("Corpus Hermeticum — Internet Archive", &head, &text.to_lowercase(), &lex),
+            "canon volume rejected"
+        );
+    }
 }

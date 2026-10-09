@@ -32,7 +32,7 @@ const VALID_KINDS: &[&str] = &["spec", "fault", "review", "dimensions", "facts",
 async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, chapters: &[String], meaning: &str, query: &str, base: &str, title: &str, text: &str) -> (String, Vec<String>, Vec<[String; 2]>, Vec<String>, String, String) {
     let excerpt: String = text.chars().take(5000).collect();
     let chlist = chapters.join(" | ");
-    let sys = format!("You file web pages into a knowledge manual on '{query}' ({meaning}). Reply with ONLY a single JSON object, no other text. Quotes must be copied EXACTLY from the text, at most 90 characters each. Relevance scores whether the page is ABOUT the subject itself — never the chapter, never derivation: something NAMED AFTER or DERIVED FROM the subject (a poetry movement named for obscurity, a band called Portugal, a surname) scores below 40 even when the chapter seems to fit. File each page into exactly one chapter: {chlist}.");
+    let sys = format!("You file web pages into a knowledge manual on '{query}' ({meaning}). Reply with ONLY a single JSON object, no other text. Quotes must be copied EXACTLY from the text, at most 90 characters each. Relevance scores whether the page is ABOUT the subject itself — never the chapter, never derivation: something NAMED AFTER or DERIVED FROM the subject (a poetry movement named for obscurity, a band called Portugal, a surname) scores below 40 even when the chapter seems to fit. A page that never names the subject, or names it once in passing while really being about something else (a political theory book mentioning the subject in one paragraph), scores below 40. File each page into exactly one chapter: {chlist}.");
     let user = format!(
         "{{\"task\": \"classify\", \"title\": \"{title}\", \"url\": \"{base}\", \"text\": \"{excerpt}\", \"want\": {{\"kind\": \"spec|fault|review|dimensions|facts|howto|reference|history|other\", \"section\": \"one of: {chlist}\", \"bullets\": [\"up to 10 facts\"], \"specs\": [[\"key\", \"value\"] up to 12], \"quotes\": [\"up to 3 verbatim spans\"]}}}}"
     );
@@ -89,7 +89,9 @@ async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, ch
         let raw_kind = v.get("kind").and_then(|k| k.as_str()).unwrap_or("other").to_lowercase();
         let kind = if VALID_KINDS.contains(&raw_kind.as_str()) { raw_kind } else { "other".into() };
         // relevance gate: the model scores fit to the query; <40 never
-        // reaches the manual (Mixolydian-mode class of drift)
+        // reaches the manual. (60 was tried: qwen3-4b scores canon content
+        // in the 40s, so 60 empties the manual. The deterministic chunk gate
+        // below is the precise instrument; the LLM gate stays at 40.)
         let relevance: i64 = v.get("relevance").and_then(|r| r.as_i64()).unwrap_or(50);
         let bullets: Vec<String> = v
             .get("bullets")
@@ -231,6 +233,32 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
         .chars()
         .take(300)
         .collect();
+    // subject lexicon from the stored card (query + subject + aliases +
+    // meaning proper nouns, all stemmed). Currently informational: per-chunk
+    // lexical gating was measured harmful (see keeper loop note) and stays
+    // out. Kept for the log line so card drift is visible per run.
+    let card_lex: Vec<String> = (|| {
+        let qc = v.get("query_card")?;
+        let card = crate::crawl::QueryCard {
+            subject: qc.get("subject").and_then(|s| s.as_str()).unwrap_or("").into(),
+            meaning: qc.get("meaning").and_then(|s| s.as_str()).unwrap_or("").into(),
+            aliases: qc
+                .get("aliases")
+                .and_then(|a| a.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default(),
+            instance: String::new(),
+        };
+        Some(crate::crawl::subject_lexicon(&query, &card))
+    })()
+    .unwrap_or_else(|| {
+        query
+            .to_lowercase()
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|t| t.len() > 2)
+            .map(|t| t.to_string())
+            .collect()
+    });
     // route inference through menagerie (house control plane): ensure the
     // magpie slot, resolve its URL. No raw-port assumptions.
     let app = llm_app();
@@ -242,6 +270,9 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
         let _ = tx.send(format!("model: {endpoint}"));
     }
     let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().map_err(|e| MagpieError::Network(e.to_string()))?;
+    if let Some(tx) = &prog {
+        let _ = tx.send(format!("subject lexicon ({} tokens)", card_lex.len()));
+    }
     let mut entries = vec![];
     // volume guard: cap keepers so hundred-chunk book pulls stay tractable.
     // Round-robin across hosts (breadth first), densest first within host.
@@ -307,6 +338,13 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
         let url = p.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string();
         let title = p.get("title").and_then(|u| u.as_str()).unwrap_or("").to_string();
         let text = p.get("text").and_then(|u| u.as_str()).unwrap_or("").to_string();
+        // NOTE: no deterministic chunk gate here by design. Corpus dialogue
+        // chunks (Tat/Asclepius speaking, "Hermes" unnamed for pages) carry
+        // zero subject tokens yet are the canon itself; lexical per-chunk
+        // gating kills the patient with the disease (measured: 65/101 canon
+        // chunks score zero alongside 71/71 Dugin chunks). Wrong-WORK
+        // rejection lives at book intake (crawl.rs book_about_subject);
+        // per-chunk relevance stays with the LLM relevance score below.
         if let Some(tx) = &prog {
             let _ = tx.send(format!("pixie {}/{} {}", n + 1, kept_total, url.chars().take(50).collect::<String>()));
         }
