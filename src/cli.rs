@@ -50,6 +50,12 @@ pub enum Cmd {
         /// Seek dir (default: most recent under ~/.cache/magpie/seek/)
         dir: Option<String>,
     },
+    /// Judge a finished manual: fact-check top claims against fresh
+    /// searches, text verdict; APPROVED appends a verdict appendix
+    Judge {
+        /// Seek dir (default: most recent under ~/.cache/magpie/seek/)
+        dir: Option<String>,
+    },
     /// Pixie pass: one quick local AI task per crawled entry, then structured PDF
     Process {
         /// Seek dir (contains seek.json)

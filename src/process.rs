@@ -25,71 +25,9 @@ struct Entry {
     claimed_by: usize,
 }
 
-fn llm_app() -> String {
-    std::env::var("MAGPIE_LLM_APP").unwrap_or_else(|_| "magpie".into())
-}
-
-/// Resolve the inference endpoint through menagerie (the house control
-/// plane): ensure the app slot, then read its URL. Falls back to
-/// PIXIE_LLM_URL, then pixie's :8080. Returns (url, via_tag).
-async fn llm_endpoint() -> (String, String) {
-    let app = llm_app();
-    // GPU: the house Vulkan server + offload travel with the ensure call,
-    // so the magpie slot stays GPU-backed across evictions/restarts.
-    // Opt out with MAGPIE_GPU=0 (falls back to default CPU binary).
-    let gpu = std::env::var("MAGPIE_GPU").map(|v| v != "0").unwrap_or(true);
-    let mut cmd = tokio::process::Command::new("menagerie");
-    cmd.args(["ensure", &app]);
-    if gpu {
-        cmd.env("PIXIE_LLAMA_SERVER", format!("{}/.local/lib/llama-vulkan/llama-server-vk", std::env::var("HOME").unwrap_or_else(|_| "/home/evenweaker".into())));
-        cmd.env("PIXIE_LLM_NGL", "99");
-    }
-    let out = cmd.output().await;
-    if out.map(|o| o.status.success()).unwrap_or(false) {
-        if let Ok(p) = tokio::process::Command::new("menagerie")
-            .args(["path", &app])
-            .output()
-            .await
-        {
-            let txt = String::from_utf8_lossy(&p.stdout);
-            for ln in txt.lines() {
-                if let Some(url) = ln.strip_prefix("URL=") {
-                    let url = url.trim().to_string();
-                    if !url.is_empty() {
-                        return (url, format!("llm:{app}"));
-                    }
-                }
-            }
-        }
-    }
-    // fallbacks keep old behavior working when menagerie is absent
-    if let Ok(u) = std::env::var("PIXIE_LLM_URL") {
-        if !u.trim().is_empty() {
-            return (u, "llm:env".into());
-        }
-    }
-    ("http://127.0.0.1:8080".into(), "llm:pixie-fallback".into())
-}
+use crate::llm::{llm_app, llm_endpoint};
 
 const VALID_KINDS: &[&str] = &["spec", "fault", "review", "dimensions", "facts", "howto", "reference", "history", "other"];
-
-/// One quick LLM task per entry via OpenAI chat endpoint with enforced
-/// `response_format: json_object`. Returns (kind, bullets, specs, via).
-async fn chat_once(client: &reqwest::Client, url: &str, body: &serde_json::Value) -> std::result::Result<String, String> {
-    // NOTE: llama-server answers after full generation (no stream), so the
-    // send() budget must cover CPU prompt eval + generation (~60-90s).
-    let resp = tokio::time::timeout(
-        std::time::Duration::from_secs(150),
-        client.post(url).json(body).send(),
-    )
-    .await
-    .map_err(|e| format!("send:{e}"))?
-    .map_err(|e| format!("send:{e}"))?;
-    tokio::time::timeout(std::time::Duration::from_secs(30), resp.text())
-        .await
-        .map_err(|e| format!("body:{e}"))?
-        .map_err(|e| format!("body:{e}"))
-}
 
 async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, chapters: &[String], meaning: &str, query: &str, base: &str, title: &str, text: &str) -> (String, Vec<String>, Vec<[String; 2]>, Vec<String>, String, String) {
     let excerpt: String = text.chars().take(5000).collect();
@@ -124,61 +62,30 @@ async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, ch
         }],
         "tool_choice": {"type": "function", "function": {"name": "classify_entry"}},
     });
-    let url = format!("{base}/v1/chat/completions", base = endpoint.trim_end_matches('/'));
-    let mut attempt = chat_once(client, &url, &body).await;
-    if attempt.is_err() {
+    let mut attempt = crate::llm::chat_json(client, endpoint, &sys, &user, 700, 0.1).await;
+    if attempt.is_none() {
         // model may have been idle-evicted mid-run: summon its slot once, retry once
         let mut cmd = tokio::process::Command::new("menagerie");
-        cmd.args(["ensure", &llm_app()]);
+        cmd.args(["ensure", &crate::llm::llm_app()]);
         if std::env::var("MAGPIE_GPU").map(|v| v != "0").unwrap_or(true) {
             cmd.env("PIXIE_LLAMA_SERVER", format!("{}/.local/lib/llama-vulkan/llama-server-vk", std::env::var("HOME").unwrap_or_else(|_| "/home/evenweaker".into())));
             cmd.env("PIXIE_LLM_NGL", "99");
         }
         let _ = cmd.output().await;
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        attempt = chat_once(client, &url, &body).await;
+        attempt = crate::llm::chat_json(client, endpoint, &sys, &user, 700, 0.1).await;
     }
-    let txt = match attempt {
-        Ok(t) => t,
-        Err(e) => {
+    // tool contract first (real function call), envelope/content JSON after.
+    // Heuristic never silent.
+    let (v, tooled) = match attempt {
+        Some((v, tooled)) => (v, tooled),
+        None => {
             let sec = chapters.last().cloned().unwrap_or_else(|| "Other".into());
-            return with_via(heuristic(title, &excerpt), vec![], sec, &format!("heuristic:{e}").chars().take(48).collect::<String>());
+            return with_via(heuristic(title, &excerpt), vec![], sec, "heuristic:no-llm");
         }
     };
-    // tool contract first: choices[0].message.tool_calls[0].function.arguments
-    // (real function call, not prose). This server build may instead emit
-    // the call as content {"name":..,"arguments":{..}} — accept that too.
-    // Content-JSON last. Heuristic never silent.
-    let root: Option<serde_json::Value> =
-        serde_json::from_str::<serde_json::Value>(&txt).ok();
-    let tool_args = root
-        .as_ref()
-        .and_then(|v| {
-            v["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
-                .as_str()
-                .map(|s| s.to_string())
-        })
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-    let content = root
-        .as_ref()
-        .and_then(|v| v["choices"][0]["message"]["content"].as_str().map(|s| s.to_string()))
-        .unwrap_or_default();
-    // unwrap this server's {"name","arguments"} envelope when present
-    let enveloped = serde_json::from_str::<serde_json::Value>(content.trim())
-        .ok()
-        .and_then(|v| {
-            if v.get("name").is_some() && v.get("arguments").is_some() {
-                Some(v["arguments"].clone())
-            } else {
-                Some(v)
-            }
-        });
     let parsed: Option<(String, Vec<String>, Vec<[String; 2]>, Vec<String>, String, bool, i64)> = (|| {
-        // prefer the tool call; then the envelope; fall back to raw content JSON
-        let (v, tooled): (serde_json::Value, bool) = match tool_args {
-            Some(t) => (t, true),
-            None => (enveloped?, false),
-        };
+        // v resolved by llm::chat_json (tool contract → envelope → content)
         let raw_kind = v.get("kind").and_then(|k| k.as_str()).unwrap_or("other").to_lowercase();
         let kind = if VALID_KINDS.contains(&raw_kind.as_str()) { raw_kind } else { "other".into() };
         // relevance gate: the model scores fit to the query; <40 never

@@ -146,13 +146,16 @@ pub async fn run_tui() -> anyhow::Result<()> {
                         }
                     }
                     KeyCode::Char(c) => {
-                        if k.modifiers.contains(KeyModifiers::CONTROL) && (c == 'u' || c == 'U') {
+                        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+                        // Ctrl+ runes never collide with typing (plain p/e
+                        // hijacked first letters — fixed)
+                        if ctrl && (c == 'u' || c == 'U') {
                             if seeking.is_none() {
                                 input.clear();
                                 cursor = 0;
                                 hist_i = None;
                             }
-                        } else if k.modifiers.contains(KeyModifiers::CONTROL) && (c == 'o' || c == 'O') {
+                        } else if ctrl && (c == 'o' || c == 'O') {
                             // open rune: viewer on last pdf (never blocks the TUI)
                             if last_pdf != "no seek yet" {
                                 let pdf = last_pdf.clone();
@@ -168,25 +171,59 @@ pub async fn run_tui() -> anyhow::Result<()> {
                             } else {
                                 log.push("no PDF yet — seek first".into());
                             }
-                        } else if c == 'p' && seeking.is_none() && view == View::Log && input.is_empty() && last_dir.is_some() {
+                        } else if ctrl && (c == 'p' || c == 'P') {
                             // pixie pass on last seek dir
-                            let dir = last_dir.clone().unwrap();
-                            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-                            let handle = tokio::spawn(async move {
-                                crate::process::run_process(dir, Some(tx)).await.map_err(|e| e.to_string())
-                            });
-                            seeking = Some(SeekJob { query: "process".into(), rx, handle: Some(handle), status: "pixie pass…".into(), kind: JobKind::Process });
-                            seek_start = Some(std::time::Instant::now());
-                            last_msg_at = Some(std::time::Instant::now());
-                            log.push("process started… (Esc cancels)".into());
-                            auto_tail = true;
-                            log_off = 0;
-                        } else if c == 'e' && seeking.is_none() && !entries.is_empty() && (view == View::Entries || input.is_empty()) {
-                            view = if view == View::Entries { View::Log } else { View::Entries };
-                            if view == View::Log {
+                            if seeking.is_none() && view == View::Log && last_dir.is_some() {
+                                let dir = last_dir.clone().unwrap();
+                                let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                                let handle = tokio::spawn(async move {
+                                    crate::process::run_process(dir, Some(tx)).await.map_err(|e| e.to_string())
+                                });
+                                seeking = Some(SeekJob { query: "process".into(), rx, handle: Some(handle), status: "pixie pass…".into(), kind: JobKind::Process });
+                                seek_start = Some(std::time::Instant::now());
+                                last_msg_at = Some(std::time::Instant::now());
+                                log.push("process started… (Esc cancels)".into());
                                 auto_tail = true;
                                 log_off = 0;
+                            } else if seeking.is_some() {
+                                log.push("busy — Esc cancels first".into());
+                            } else {
+                                log.push("nothing to process — seek first".into());
                             }
+                        } else if ctrl && (c == 'e' || c == 'E') {
+                            if seeking.is_none() && !entries.is_empty() {
+                                view = if view == View::Entries { View::Log } else { View::Entries };
+                                if view == View::Log {
+                                    auto_tail = true;
+                                    log_off = 0;
+                                }
+                            } else if entries.is_empty() {
+                                log.push("no entries yet — process first".into());
+                            }
+                        } else if ctrl && (c == 'j' || c == 'J') {
+                            // judge rune: fact-check last manual, text verdict
+                            if seeking.is_none() && view == View::Log && last_dir.is_some() {
+                                let dir = last_dir.clone().unwrap();
+                                let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                                let handle = tokio::spawn(async move {
+                                    crate::judge::run_judge(dir, Some(tx)).await.map_err(|e| e.to_string())
+                                });
+                                seeking = Some(SeekJob { query: "judge".into(), rx, handle: Some(handle), status: "judging…".into(), kind: JobKind::Judge });
+                                seek_start = Some(std::time::Instant::now());
+                                last_msg_at = Some(std::time::Instant::now());
+                                log.push("judge started… (Esc cancels)".into());
+                                auto_tail = true;
+                                log_off = 0;
+                            } else if seeking.is_some() {
+                                log.push("busy — Esc cancels first".into());
+                            } else {
+                                log.push("nothing to judge — process first".into());
+                            }
+                        } else if c == 'e' && view == View::Entries {
+                            // plain e walks back out of the entries view
+                            view = View::Log;
+                            auto_tail = true;
+                            log_off = 0;
                         } else if seeking.is_none() && view == View::Log {
                             let idx = cursor.min(input.chars().count());
                             let byte: usize = input.chars().take(idx).map(|ch| ch.len_utf8()).sum();
@@ -297,20 +334,32 @@ pub async fn run_tui() -> anyhow::Result<()> {
             }
             let finished = job.handle.as_ref().map(|h| h.is_finished()).unwrap_or(false);
             if finished {
-                let was_manual = !matches!(job.kind, JobKind::Seek);
+                let kind = job.kind;
                 if let Some(h) = job.handle.take() {
                     match h.await {
                         Ok(Ok(dir)) => {
                             last_dir = Some(dir.clone());
-                            if was_manual {
+                            if kind == JobKind::Judge {
                                 last_pdf = format!("{}/manual.pdf", dir.display());
                                 entries = load_entries(&dir);
                                 sel = 0;
-                                let n_llm = entries.iter().filter(|e| e.via == "llm").count();
-                                log.push(format!("manual ready: {} entries (llm:{n_llm}) — [e] entries", entries.len()));
-                            } else {
+                                let rec: serde_json::Value = std::fs::read_to_string(dir.join("judgment.json"))
+                                    .ok()
+                                    .and_then(|s| serde_json::from_str(&s).ok())
+                                    .unwrap_or(serde_json::Value::Null);
+                                let overall = rec.get("overall").and_then(|o| o.as_str()).unwrap_or("?");
+                                let comment = rec.get("comment").and_then(|c| c.as_str()).unwrap_or("").chars().take(160).collect::<String>();
+                                log.push(format!("judge: {overall} — {comment}"));
+                                log.push("full verdict in judgment.txt — [Ctrl-O] reopens manual".into());
+                            } else if kind == JobKind::Seek {
                                 last_pdf = format!("{}/dump.pdf", dir.display());
-                                log.push(format!("dump ready -> {last_pdf} — [p] process for manual.pdf"));
+                                log.push(format!("dump ready -> {last_pdf} — [Ctrl-P] process for manual.pdf"));
+                            } else {
+                                last_pdf = format!("{}/manual.pdf", dir.display());
+                                entries = load_entries(&dir);
+                                sel = 0;
+                                let n_llm = entries.iter().filter(|e| e.via.starts_with("llm")).count();
+                                log.push(format!("manual ready: {} entries (llm:{n_llm}) — [Ctrl-E] entries, [Ctrl-J] judge", entries.len()));
                             }
                         }
                         Ok(Err(e)) => log.push(format!("error: {e}")),
@@ -351,6 +400,7 @@ enum JobKind {
     Seek,
     Process,
     Manual,
+    Judge,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -379,7 +429,7 @@ fn draw(
     let spin = SPINNER[(tick / 2) % SPINNER.len()];
     let busy = seeking.is_some();
 
-    let runes_h = 4usize;
+    let runes_h = 5usize;
     let sig_h = 1usize;
     let gaps = 2usize;
     let prompt_h = 4usize;
@@ -420,6 +470,7 @@ fn draw(
         let title = match job.kind {
             JobKind::Manual => "Manual",
             JobKind::Process => "Process",
+            JobKind::Judge => "Judge",
             JobKind::Seek => "Seek",
         };
         frame.push_str(&crate::termart::panel(&body, title, w, Some(seek_h), false));
@@ -488,15 +539,16 @@ fn draw(
     let mut chips = if busy {
         "[working…]  [Esc] cancel".to_string()
     } else {
-        "[Enter] seek · [Esc] quit · [↑↓] history · [PgUp/PgDn] scroll · [←→] caret · [Ctrl-U] clear · [Ctrl-O] open pdf".to_string()
+        "[Enter] seek · [Ctrl-P] process · [Ctrl-J] judge · [Ctrl-E] entries · [Ctrl-O] open · [Esc] quit".to_string()
     };
+    let nav = "[↑↓] history · [PgUp/PgDn] scroll · [←→] caret · [Ctrl-U] clear";
     if !busy && can_process {
         chips.push_str(" · [p] process");
     }
     if !entries.is_empty() {
         chips.push_str(" · [e] entries");
     }
-    frame.push_str(&crate::termart::panel(&[chips, format!("pdf: {last_pdf}")], "Runes", w, Some(runes_h), false));
+    frame.push_str(&crate::termart::panel(&[chips, nav.into(), format!("pdf: {last_pdf}")], "Runes", w, Some(runes_h + 1), false));
     frame.push('\n');
     frame.push_str(&crate::termart::signature(w));
 

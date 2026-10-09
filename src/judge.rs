@@ -1,0 +1,185 @@
+//! Judge pass: fact-checks a finished manual against fresh web searches,
+//! then delivers a text verdict. APPROVED appends a judge's appendix to
+//! the PDF (comment + method); REDO leaves the PDF untouched and reports
+//! reasons as text (no render cost for a rejection).
+
+use crate::error::{MagpieError, Result};
+
+struct Claim {
+    text: String,
+    source: String,
+}
+
+/// Top claims, spec/fault kinds first (checkable facts beat prose).
+fn top_claims(entries: &[serde_json::Value]) -> Vec<Claim> {
+    let mut ordered: Vec<&serde_json::Value> = vec![];
+    for kind in ["spec", "fault", "facts", "review", "dimensions", "howto", "reference", "history", "other"] {
+        for e in entries.iter().filter(|e| e.get("kind").and_then(|k| k.as_str()) == Some(kind)) {
+            ordered.push(e);
+        }
+    }
+    let mut out = vec![];
+    for e in ordered {
+        let source = e.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string();
+        let mut facts: Vec<String> = vec![];
+        if let Some(arr) = e.get("bullets").and_then(|b| b.as_array()) {
+            for b in arr.iter().take(2) {
+                if let Some(s) = b.as_str() {
+                    facts.push(s.to_string());
+                }
+            }
+        }
+        if let Some(arr) = e.get("specs").and_then(|b| b.as_array()) {
+            for s in arr.iter().take(2) {
+                if let (Some(k), Some(v)) = (s.get(0).and_then(|x| x.as_str()), s.get(1).and_then(|x| x.as_str())) {
+                    facts.push(format!("{k}: {v}"));
+                }
+            }
+        }
+        for f in facts {
+            if f.chars().count() > 25 {
+                out.push(Claim { text: f.chars().take(160).collect(), source: source.clone() });
+            }
+            if out.len() >= 10 {
+                return out;
+            }
+        }
+    }
+    out
+}
+
+pub async fn run_judge(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc::UnboundedSender<String>>) -> Result<std::path::PathBuf> {
+    let send = |m: &str| {
+        if let Some(tx) = &prog {
+            let _ = tx.send(m.to_string());
+        }
+    };
+    let raw = std::fs::read_to_string(dir.join("processed.json")).map_err(|e| MagpieError::Io(e.to_string()))?;
+    let v: serde_json::Value = serde_json::from_str(&raw).map_err(|e| MagpieError::Parse(e.to_string()))?;
+    let query = v.get("query").and_then(|q| q.as_str()).unwrap_or("seek").to_string();
+    let entries = v.get("entries").and_then(|e| e.as_array()).cloned().unwrap_or_default();
+    let claims = top_claims(&entries);
+    if claims.is_empty() {
+        return Err(MagpieError::Parse("no checkable claims".into()));
+    }
+    // ≥10 verification searches of our own (one+ per claim, distinct queries)
+    send(&format!("judge: verifying {} claims…", claims.len()));
+    let mut pairs = vec![];
+    for (i, c) in claims.iter().enumerate() {
+        let q: String = c.text.chars().take(80).collect();
+        if let Some(tx) = &prog {
+            let _ = tx.send(format!("judge search {}/{} {}", i + 1, claims.len(), q.chars().take(40).collect::<String>()));
+        }
+        let mut evidence = vec![];
+        for u in crate::crawl::verify_search(&c.text).await {
+            if evidence.len() >= 2 {
+                break;
+            }
+            if let Some(p) = crate::crawl::fetch_snippet(&u).await {
+                evidence.push(format!("{}: {}", u, p));
+            }
+        }
+        pairs.push(serde_json::json!({"claim": c.text, "manual_source": c.source, "evidence": evidence}));
+    }
+    // one judge call over all pairs
+    let (endpoint, via_tag) = crate::llm::llm_endpoint().await;
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().map_err(|e| MagpieError::Network(e.to_string()))?;
+    let sys = "You are the judge of a researched manual. For each claim, verdict supported|contested|unverified from the evidence. Then overall APPROVED or REDO. Reply ONLY JSON.";
+    let user = serde_json::json!({
+        "manual": query,
+        "pairs": pairs,
+        "want": {"verdicts": [{"claim": "", "verdict": "supported|contested|unverified", "note": ""}], "overall": "APPROVED|REDO", "comment": "why approved and how fact-checked, or why it must be redone"}
+    })
+    .to_string();
+    send("judge: deliberating…");
+    let mut judgment = serde_json::json!({"overall": "REDO", "comment": "judge unreachable", "verdicts": []});
+    let mut judge_via = "heuristic:judge-down";
+    if let Some((val, tooled)) = crate::llm::chat_json(&client, &endpoint, sys, &user, 600, 0.1).await {
+        let _ = tooled;
+        judgment = val;
+        judge_via = Box::leak(format!("{via_tag}:judge").into_boxed_str());
+    }
+    let overall = judgment.get("overall").and_then(|o| o.as_str()).unwrap_or("REDO").to_string();
+    let comment = judgment.get("comment").and_then(|c| c.as_str()).unwrap_or("").to_string();
+    let record = serde_json::json!({
+        "query": query,
+        "overall": overall,
+        "comment": comment,
+        "via": judge_via,
+        "verdicts": judgment.get("verdicts").cloned().unwrap_or(serde_json::Value::Null),
+        "searches": pairs.len(),
+    });
+    std::fs::write(dir.join("judgment.json"), serde_json::to_string_pretty(&record).unwrap()).map_err(|e| MagpieError::Io(e.to_string()))?;
+    // human text form: no PDF cost for reading the verdict
+    let mut txt = format!("JUDGMENT: {} ({})\n{}\n\n", overall, judge_via, comment);
+    if let Some(arr) = record.get("verdicts").and_then(|x| x.as_array()) {
+        for vd in arr {
+            txt.push_str(&format!(
+                "- [{}] {}\n  {}\n",
+                vd.get("verdict").and_then(|x| x.as_str()).unwrap_or("?"),
+                vd.get("claim").and_then(|x| x.as_str()).unwrap_or(""),
+                vd.get("note").and_then(|x| x.as_str()).unwrap_or("")
+            ));
+        }
+    }
+    std::fs::write(dir.join("judgment.txt"), txt).map_err(|e| MagpieError::Io(e.to_string()))?;
+    send(&format!("judge: {overall}"));
+    if overall == "APPROVED" {
+        // appendix page: the judge's comment + method, inside the document
+        if let Some(tx) = &prog {
+            let _ = tx.send("judge: appending verdict…".into());
+        }
+        append_verdict(&dir, &query, &comment)?;
+    }
+    Ok(dir)
+}
+
+/// Appendix: re-render is overkill — append one page via the manual writer.
+/// Reuses render path with an appendix section.
+fn append_verdict(dir: &std::path::Path, query: &str, comment: &str) -> Result<()> {
+    let raw = std::fs::read_to_string(dir.join("processed.json")).map_err(|e| MagpieError::Io(e.to_string()))?;
+    let v: serde_json::Value = serde_json::from_str(&raw).map_err(|e| MagpieError::Parse(e.to_string()))?;
+    let chapters: Vec<String> = v
+        .get("chapters")
+        .and_then(|c| c.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_else(|| vec!["Facts".into()]);
+    let mut mentries: Vec<crate::pdf::ManualEntry> = vec![];
+    if let Some(arr) = v.get("entries").and_then(|e| e.as_array()) {
+        for e in arr {
+            mentries.push(crate::pdf::ManualEntry {
+                kind: e.get("kind").and_then(|k| k.as_str()).unwrap_or("other").into(),
+                title: e.get("title").and_then(|k| k.as_str()).unwrap_or("").into(),
+                url: e.get("url").and_then(|k| k.as_str()).unwrap_or("").into(),
+                via: e.get("via").and_then(|k| k.as_str()).unwrap_or("").into(),
+                claimed_by: e.get("claimed_by").and_then(|k| k.as_u64()).unwrap_or(0) as usize,
+                section: e.get("section").and_then(|k| k.as_str()).unwrap_or("").into(),
+                quotes: vec![],
+                bullets: vec![],
+                specs: vec![],
+            });
+        }
+    }
+    let hosts: Vec<String> = {
+        let mut h: Vec<String> = mentries.iter().filter_map(|p| url::Url::parse(&p.url).ok()).map(|u| u.host_str().unwrap_or("").to_string()).collect();
+        h.sort();
+        h.dedup();
+        h
+    };
+    // verdict entry lives in its own appendix chapter
+    let mut chapters2 = chapters.clone();
+    chapters2.push("Judge's verdict: APPROVED".into());
+    mentries.push(crate::pdf::ManualEntry {
+        kind: "verdict".into(),
+        title: "Why this manual was approved".into(),
+        url: String::new(),
+        via: "llm:judge".into(),
+        claimed_by: 0,
+        section: "Judge's verdict: APPROVED".into(),
+        quotes: vec![],
+        bullets: vec![comment.chars().take(1200).collect()],
+        specs: vec![],
+    });
+    crate::pdf::render_manual(query, &chapters2, &Default::default(), &mentries, &hosts, &dir.join("manual.pdf"))?;
+    Ok(())
+}

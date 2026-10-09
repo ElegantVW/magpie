@@ -128,6 +128,7 @@ pub async fn query_card(query: &str) -> QueryCard {
                                     .take(400)
                                     .collect();
                                 if !def.is_empty() {
+                                    crate::db::append("dict", serde_json::json!({"word": query, "extract": def}));
                                     if !card.meaning.is_empty() {
                                         card.meaning.push_str(" | ");
                                     }
@@ -140,6 +141,11 @@ pub async fn query_card(query: &str) -> QueryCard {
             }
         }
     }
+    // thesaurus record: entity + aliases persist for every later run
+    crate::db::append(
+        "thesaurus",
+        serde_json::json!({"query": query, "subject": card.subject, "aliases": card.aliases, "instance": card.instance}),
+    );
     card
 }
 
@@ -836,11 +842,124 @@ async fn wiki_related(query: &str) -> Vec<String> {
     out
 }
 
+/// Thirty languages, fixed list (top Wikipedias). Translations come from
+/// the entity's own labels — deterministic, no MT, no key. Each language
+/// then searches IN its own tongue through its own Wikipedia.
+const LANGS30: &[&str] = &[
+    "en", "de", "fr", "es", "it", "pt", "nl", "pl", "ru", "ja",
+    "zh", "sv", "fi", "no", "da", "cs", "hu", "ro", "tr", "ar",
+    "fa", "hi", "ko", "id", "ms", "th", "vi", "el", "he", "uk",
+];
+
+/// Translations of the query entity + per-language Wikipedia fan-out.
+/// Returns (lang, label, urls). Capped at 12 productive languages.
+async fn translations(query: &str, prog: &Option<tokio::sync::mpsc::UnboundedSender<String>>) -> Vec<(String, String, Vec<String>)> {
+    let send = |m: &str| {
+        if let Some(tx) = prog {
+            let _ = tx.send(m.to_string());
+        }
+    };
+    let c = client();
+    let s = match c
+        .get(&format!(
+            "https://www.wikidata.org/w/api.php?action=wbsearchentities&search={}&language=en&format=json&limit=1",
+            url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>()
+        ))
+        .send()
+        .await
+    {
+        Ok(r) => r.text().await.unwrap_or_default(),
+        Err(_) => return vec![],
+    };
+    let id: String = match Regex::new(r#""id":"(Q\d+)""#)
+        .unwrap()
+        .captures(&s)
+        .map(|c| c[1].to_string())
+    {
+        Some(id) => id,
+        None => return vec![],
+    };
+    let t = match c
+        .get(&format!("https://www.wikidata.org/w/api.php?action=wbgetentities&ids={id}&props=labels&format=json"))
+        .send()
+        .await
+    {
+        Ok(r) => r.text().await.unwrap_or_default(),
+        Err(_) => return vec![],
+    };
+    let v: serde_json::Value = serde_json::from_str(&t).unwrap_or(serde_json::Value::Null);
+    let labels = v.get("entities").and_then(|e| e.get(&id)).and_then(|e| e.get("labels"));
+    let mut out = vec![];
+    for lang in LANGS30.iter().filter(|l| **l != "en") {
+        let label = labels
+            .and_then(|l| l.get(*lang))
+            .and_then(|l| l.get("value"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        if label.is_empty() {
+            continue;
+        }
+        let u = format!(
+            "https://{lang}.wikipedia.org/w/api.php?action=opensearch&search={}&limit=2&format=json",
+            url::form_urlencoded::byte_serialize(label.as_bytes()).collect::<String>()
+        );
+        let r = match c.get(&u).send().await {
+            Ok(r) => r.text().await.unwrap_or_default(),
+            Err(_) => continue,
+        };
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap_or(serde_json::Value::Null);
+        let mut urls = vec![];
+        if let Some(arr) = v.as_array() {
+            if let Some(links) = arr.get(3).and_then(|x| x.as_array()) {
+                for link in links.iter().take(2) {
+                    if let Some(s) = link.as_str() {
+                        urls.push(s.to_string());
+                    }
+                }
+            }
+        }
+        if !urls.is_empty() {
+            out.push((lang.to_string(), label, urls));
+        }
+        if out.len() >= 12 {
+            break;
+        }
+    }
+    send(&format!("search: translations ({} langs with hits)", out.len()));
+    out
+}
+
+/// Verification search for the judge: distinct query per claim,
+/// top hits only. Part of the ≥10-searches-of-our-own evidence round.
+pub(crate) async fn verify_search(claim: &str) -> Vec<String> {
+    let q: String = claim.chars().take(80).collect();
+    let mut out = ddg_search_tries(&q, 3, 2, 10).await;
+    if out.is_empty() {
+        out = marginalia_tries(&q, 3, 2, 10).await;
+    }
+    out.into_iter().take(3).collect()
+}
+
 fn wikipedia_api(query: &str) -> String {
     format!(
         "https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={}&format=json&srlimit=5",
         url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>()
     )
+}
+
+/// Snippet fetch for evidence: title + first 600 chars, or None.
+pub(crate) async fn fetch_snippet(url: &str) -> Option<String> {
+    match fetch_one(url).await {
+        Ok(p) => {
+            let t: String = p.text.chars().take(600).collect();
+            if t.chars().count() < 80 {
+                return None;
+            }
+            Some(format!("{} — {}", p.title.chars().take(80).collect::<String>(), t))
+        }
+        Err(_) => None,
+    }
 }
 
 /// Wikidata: structured facts via API (search → claims → label resolve).
@@ -1247,6 +1366,12 @@ pub struct CrawlPlan {
     pub legs: Vec<(String, usize)>,
     /// what the query means (drives gates + relevance downstream)
     pub query_card: QueryCard,
+    /// LLM-spawned web queries from the expansion pass
+    #[serde(default)]
+    pub expansion: Vec<String>,
+    /// per-language query forms: (lang, label, urls found)
+    #[serde(default)]
+    pub translations: Vec<(String, String, String)>,
 }
 
 /// Build thorough URL list: DDG + Marginalia + Wikipedia titles.
@@ -1288,6 +1413,43 @@ pub async fn plan_urls(
     // expanded lexicon: query terms + aliases feed the gates
     // (cross-badge misses die here, not in the manual)
     let gate_q = format!("{} {}", query, card.aliases.join(" "));
+
+    // expansion pass: one LLM call reads the query + card and spawns
+    // additional web queries from what it knows (subtopics, aliases,
+    // technique queries). Stored in seek.json as `expansion`.
+    let mut expansion_queries: Vec<String> = vec![];
+    {
+        let (endpoint, _) = crate::llm::llm_endpoint().await;
+        let client = client();
+        let sys = "You expand a research query into web searches. Reply ONLY JSON.";
+        let user = serde_json::json!({
+            "query": query,
+            "meaning": card.meaning,
+            "aliases": card.aliases,
+            "domain": subject_domain(query, &card.instance),
+            "want": {"queries": ["6-10 distinct web search queries: subtopics, alias forms, key figures, technique queries"]}
+        })
+        .to_string();
+        if let Some((v, _)) = crate::llm::chat_json(&client, &endpoint, sys, &user, 300, 0.2).await {
+            if let Some(arr) = v.get("queries").and_then(|q| q.as_array()) {
+                for q in arr.iter().take(10) {
+                    if let Some(s) = q.as_str() {
+                        let s = s.trim().to_string();
+                        if !s.is_empty() && s.len() < 120 {
+                            expansion_queries.push(s);
+                        }
+                    }
+                }
+            }
+        }
+        if !expansion_queries.is_empty() {
+            send(&format!("understand: +{} spawned queries", expansion_queries.len()));
+        }
+        crate::db::append(
+            "expansions",
+            serde_json::json!({"query": query, "queries": expansion_queries}),
+        );
+    }
 
     send("search: duckduckgo…");
     let ddg = match tokio::time::timeout(std::time::Duration::from_secs(20), ddg_search(query, per_engine)).await {
@@ -1497,6 +1659,33 @@ pub async fn plan_urls(
         }
         legs.push(("related".into(), urls.len() - mark));
     }
+    // translations: the query in up to 30 tongues, each searching its own
+    // Wikipedia (Orange -> naranja, orange, arancia…). Corroboration across
+    // languages, plus non-English quotes for the manual.
+    let mut trans_flat: Vec<(String, String, String)> = vec![];
+    if urls.len() < max_pages + 8 {
+        send("search: translations (30 langs)…");
+        for (lang, label, turls) in translations(query, &prog).await {
+            for u in turls {
+                if spam_url(&u) || !seen.insert(canon_url(&u)) {
+                    continue;
+                }
+                trans_flat.push((lang.clone(), label.clone(), u.clone()));
+                urls.push(u);
+                if urls.len() >= max_pages + 8 {
+                    break;
+                }
+            }
+            if urls.len() >= max_pages + 8 {
+                break;
+            }
+        }
+        legs.push(("translations".into(), trans_flat.len()));
+        crate::db::append(
+            "translations",
+            serde_json::json!({"query": query, "hits": trans_flat.iter().map(|(l, t, u)| serde_json::json!({"lang": l, "label": t, "url": u})).collect::<Vec<_>>()}),
+        );
+    }
     // bulk legs: sitemaps + Common Crawl on hosts already seen (no search engine)
     if urls.len() < max_pages {
         let mark = urls.len();
@@ -1553,6 +1742,10 @@ pub async fn plan_urls(
         let mut variants = chapter_queries(query, &domain);
         for a in alias_queries(query) {
             variants.push(a);
+        }
+        // LLM-spawned queries join the same ring budgets and gates
+        for q in expansion_queries.iter().take(8) {
+            variants.push(q.clone());
         }
         // per-chapter ring merge: each chapter gets its fair share first,
         // so one loud chapter can't eat the whole budget (Portugal's
@@ -1619,8 +1812,8 @@ pub async fn plan_urls(
         }
         true
     });
-    urls.truncate(max_pages);
-    CrawlPlan { urls, prefetched, legs, query_card: card }
+    urls.truncate(max_pages + 8);
+    CrawlPlan { urls, prefetched, legs, query_card: card, expansion: expansion_queries, translations: trans_flat }
 }
 
 /// robots.txt, cached per host: best-effort Disallow check.
@@ -1706,6 +1899,12 @@ pub async fn crawl_urls(urls: &[String], prog: Option<tokio::sync::mpsc::Unbound
                         }
                         return None;
                     }
+                    // raw reserve: extracted text persisted for later
+                    // rinse/filter passes (TBs spare, keep everything)
+                    crate::db::append(
+                        "crawl",
+                        serde_json::json!({"url": p.url, "title": p.title, "chars": p.chars, "text": p.text}),
+                    );
                     if let Some(tx) = &prog {
                         let _ = tx.send(format!("got {}/{} {}c", i + 1, total, p.chars));
                     }

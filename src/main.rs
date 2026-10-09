@@ -1,6 +1,9 @@
 mod cli;
 mod crawl;
+mod db;
 mod error;
+mod judge;
+mod llm;
 mod pdf;
 mod process;
 mod seek;
@@ -44,6 +47,17 @@ async fn run(c: Cli) -> anyhow::Result<()> {
             .spawn()
             .map_err(|e| anyhow::anyhow!("xdg-open failed: {e}"))?;
         println!("opened {}", pdf.display());
+        return Ok(());
+    }
+    if let Some(Cmd::Judge { dir }) = c.cmd.clone() {
+        let dir = match dir {
+            Some(d) => std::path::PathBuf::from(d),
+            None => crate::store::latest_seek_dir().ok_or_else(|| anyhow::anyhow!("no seeks yet under ~/.cache/magpie/seek/"))?,
+        };
+        let dir = crate::judge::run_judge(dir, None).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let rec: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("judgment.json")).unwrap_or_default()).unwrap_or(serde_json::Value::Null);
+        println!("judge: {}", rec.get("overall").and_then(|o| o.as_str()).unwrap_or("?"));
+        println!("{}", rec.get("comment").and_then(|c| c.as_str()).unwrap_or(""));
         return Ok(());
     }
     // compat: `magpie browse --dump URL`
