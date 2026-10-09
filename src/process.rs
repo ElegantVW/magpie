@@ -256,7 +256,8 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
             .into_iter()
             .map(|t| t.to_string())
             .collect();
-        // per-host buckets, densest first
+        // per-work buckets (host + base work, fragment stripped),
+        // densest first: one loud book can't drown the other works
         let mut by_host: std::collections::HashMap<String, Vec<(usize, usize)>> = Default::default();
         for (i, p) in arr.iter().enumerate() {
             if p.get("dup_of").and_then(|d| d.as_u64()).is_some() {
@@ -266,8 +267,10 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
             let hits: usize = qtokens.iter().map(|tok| t.matches(tok).count()).sum();
             let len = p.get("text").and_then(|t| t.as_str()).map(|t| t.chars().count().max(1)).unwrap_or(1);
             let score = hits.saturating_mul(1000) / len;
-            let host = p.get("url").and_then(|u| u.as_str()).unwrap_or("").split('/').nth(2).unwrap_or("").to_string();
-            by_host.entry(host).or_default().push((score, i));
+            let url = p.get("url").and_then(|u| u.as_str()).unwrap_or("");
+            let host = url.split('/').nth(2).unwrap_or("").to_string();
+            let base = url.split('#').next().unwrap_or(url).to_string();
+            by_host.entry(format!("{host}\n{base}")).or_default().push((score, i));
         }
         for v in by_host.values_mut() {
             v.sort_by(|a, b| b.0.cmp(&a.0));
