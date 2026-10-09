@@ -19,6 +19,7 @@ fn top_claims(entries: &[serde_json::Value]) -> Vec<Claim> {
         }
     }
     let mut out = vec![];
+    let mut seen_sig: std::collections::HashSet<String> = Default::default();
     for e in ordered {
         let source = e.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string();
         let mut facts: Vec<String> = vec![];
@@ -38,6 +39,11 @@ fn top_claims(entries: &[serde_json::Value]) -> Vec<Claim> {
         }
         for f in facts {
             if f.chars().count() > 25 {
+                // specs often restate the bullet above them; one slot per fact
+                let sig: String = f.to_lowercase().chars().filter(|c| c.is_alphanumeric()).take(48).collect();
+                if !seen_sig.insert(sig) {
+                    continue;
+                }
                 out.push(Claim { text: f.chars().take(160).collect(), source: source.clone() });
             }
             if out.len() >= 10 {
@@ -83,18 +89,23 @@ pub async fn run_judge(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc::
     }
     // one judge call over all pairs
     let (endpoint, via_tag) = crate::llm::llm_endpoint().await;
-    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().map_err(|e| MagpieError::Network(e.to_string()))?;
+    // no client-level timeout: chat_once governs (150s send / 30s body).
+    // The deliberation payload is ~12KB of evidence; 30s was too tight.
+    let client = reqwest::Client::new();
     let sys = "You are the judge of a researched manual. For each claim, verdict supported|contested|unverified from the evidence. Then overall APPROVED or REDO. Reply ONLY JSON.";
     let user = serde_json::json!({
         "manual": query,
         "pairs": pairs,
-        "want": {"verdicts": [{"claim": "", "verdict": "supported|contested|unverified", "note": ""}], "overall": "APPROVED|REDO", "comment": "why approved and how fact-checked, or why it must be redone"}
+        "want": {"verdicts": [{"claim": "", "verdict": "supported|contested|unverified", "note": "under 90 chars"}], "overall": "APPROVED|REDO", "comment": "why approved and how fact-checked, or why it must be redone"}
     })
     .to_string();
     send("judge: deliberating…");
     let mut judgment = serde_json::json!({"overall": "REDO", "comment": "judge unreachable", "verdicts": []});
     let mut judge_via = "heuristic:judge-down";
-    if let Some((val, tooled)) = crate::llm::chat_json(&client, &endpoint, sys, &user, 600, 0.1).await {
+    // generous budget: 10 pairs of evidence in, 10 terse verdicts out.
+    // 600 tokens truncated mid-JSON (parse then fails → unreachable).
+    // ctx 8192 fits ~5K prompt + 1500 generation.
+    if let Some((val, tooled)) = crate::llm::chat_json(&client, &endpoint, sys, &user, 1500, 0.1).await {
         let _ = tooled;
         judgment = val;
         judge_via = Box::leak(format!("{via_tag}:judge").into_boxed_str());
@@ -154,9 +165,28 @@ fn append_verdict(dir: &std::path::Path, query: &str, comment: &str) -> Result<(
                 via: e.get("via").and_then(|k| k.as_str()).unwrap_or("").into(),
                 claimed_by: e.get("claimed_by").and_then(|k| k.as_u64()).unwrap_or(0) as usize,
                 section: e.get("section").and_then(|k| k.as_str()).unwrap_or("").into(),
-                quotes: vec![],
-                bullets: vec![],
-                specs: vec![],
+                // carry content through: the appendix is a re-render, the
+                // manual must come out identical plus the verdict page
+                quotes: e
+                    .get("quotes")
+                    .and_then(|q| q.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+                    .unwrap_or_default(),
+                bullets: e
+                    .get("bullets")
+                    .and_then(|b| b.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+                    .unwrap_or_default(),
+                specs: e
+                    .get("specs")
+                    .and_then(|s| s.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter(|p| p.as_array().map(|x| x.len() == 2).unwrap_or(false))
+                            .map(|p| [p[0].as_str().unwrap_or("").to_string(), p[1].as_str().unwrap_or("").to_string()])
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             });
         }
     }
@@ -166,6 +196,21 @@ fn append_verdict(dir: &std::path::Path, query: &str, comment: &str) -> Result<(
         h.dedup();
         h
     };
+    // chapter intros are generated at process time; re-render must carry
+    // them or the manual loses its synthesis pass
+    let intros: std::collections::HashMap<String, (String, String)> = v
+        .get("intros")
+        .and_then(|i| i.as_object())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, val)| {
+                    let t = val.get("text").and_then(|t| t.as_str())?.to_string();
+                    let via = val.get("via").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                    Some((k.clone(), (t, via)))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     // verdict entry lives in its own appendix chapter
     let mut chapters2 = chapters.clone();
     chapters2.push("Judge's verdict: APPROVED".into());
@@ -180,6 +225,49 @@ fn append_verdict(dir: &std::path::Path, query: &str, comment: &str) -> Result<(
         bullets: vec![comment.chars().take(1200).collect()],
         specs: vec![],
     });
-    crate::pdf::render_manual(query, &chapters2, &Default::default(), &mentries, &hosts, &dir.join("manual.pdf"))?;
+    crate::pdf::render_manual(query, &chapters2, &intros, &mentries, &hosts, &dir.join("manual.pdf"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::append_verdict;
+
+    #[test]
+    fn appendix_carries_entry_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let doc = serde_json::json!({
+            "query": "fidelity",
+            "chapters": ["Facts", "History"],
+            "intros": {"Facts": {"text": "UNIQUEINTRO synthesis paragraph.", "via": "llm:magpie:synth"}},
+            "entries": [
+                {
+                    "kind": "spec", "title": "Fixture entry", "url": "https://fixture.example/1",
+                    "via": "llm:magpie:json", "claimed_by": 2, "section": "Facts",
+                    "quotes": ["UNIQUEQUOTE verbatim span."],
+                    "bullets": ["UNIQUEBULLET distinctive checkable fact."],
+                    "specs": [["uniquekey", "uniquevalue"]]
+                }
+            ]
+        });
+        std::fs::write(
+            dir.path().join("processed.json"),
+            serde_json::to_string_pretty(&doc).unwrap(),
+        )
+        .unwrap();
+
+        append_verdict(dir.path(), "fidelity", "UNIQUECOMMENT the judge's method.").unwrap();
+
+        let pdf = dir.path().join("manual.pdf");
+        assert!(pdf.is_file(), "appendix render produced no pdf");
+        let out = std::process::Command::new("pdftotext")
+            .arg(&pdf)
+            .arg("-")
+            .output()
+            .unwrap();
+        let txt = String::from_utf8_lossy(&out.stdout);
+        for must in ["UNIQUEQUOTE", "UNIQUEBULLET", "uniquekey", "uniquevalue", "UNIQUEINTRO", "UNIQUECOMMENT", "Judge"] {
+            assert!(txt.contains(must), "re-render lost {must:?}:\n{txt}");
+        }
+    }
 }

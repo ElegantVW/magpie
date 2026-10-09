@@ -166,6 +166,14 @@ pub async fn run_seek_with_progress(
     let mut pages = crawl_urls(&plan.urls, prog.clone()).await;
     // bulk legs already fetched content (WARC, structured APIs): merge in
     let n_pre = plan.prefetched.len();
+    // raw reserve: bulk legs never pass through crawl_urls' archive, so
+    // persist them here — TBs are spare, the DB is the house's hoard
+    for p in plan.prefetched.iter() {
+        crate::db::append(
+            "crawl",
+            serde_json::json!({"url": p.url, "title": p.title, "chars": p.chars, "text": p.text}),
+        );
+    }
     pages.extend(plan.prefetched);
     if n_pre > 0 {
         if let Some(tx) = &prog {

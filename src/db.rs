@@ -6,9 +6,18 @@
 use std::path::PathBuf;
 
 pub fn db_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("MAGPIE_DB") {
+        if !p.trim().is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    // XDG gotcha: an exported-but-empty XDG_DATA_HOME yields Ok("") and
+    // would make every path below relative to the CWD. Treat empty as unset.
     let base = std::env::var("XDG_DATA_HOME")
+        .ok()
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| {
             let home = std::env::var("HOME").unwrap_or_else(|_| "/home/evenweaker".into());
             PathBuf::from(home).join(".local/share")
         });
