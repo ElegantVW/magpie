@@ -23,22 +23,27 @@ struct Entry {
     section: String,
     /// corroboration: how many dup pages repeat this keeper
     claimed_by: usize,
+    /// the model's 0-100 fit score, stored so any future mystery is one
+    /// cat away (intake run dropped Hermeticism-main with no score on file)
+    relevance: i64,
 }
 
 use crate::llm::{llm_app, llm_endpoint};
 
 const VALID_KINDS: &[&str] = &["spec", "fault", "review", "dimensions", "facts", "howto", "reference", "history", "other"];
 
-async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, chapters: &[String], meaning: &str, query: &str, base: &str, title: &str, text: &str) -> (String, Vec<String>, Vec<[String; 2]>, Vec<String>, String, String) {
+async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, chapters: &[String], meaning: &str, query: &str, base: &str, title: &str, text: &str) -> (String, Vec<String>, Vec<[String; 2]>, Vec<String>, String, String, i64) {
     let excerpt: String = text.chars().take(5000).collect();
     let chlist = chapters.join(" | ");
     let sys = format!("You file web pages into a knowledge manual on '{query}' ({meaning}). Reply with ONLY a single JSON object, no other text. Quotes must be copied EXACTLY from the text, at most 90 characters each. Relevance scores whether the page is ABOUT the subject itself — never the chapter, never derivation: something NAMED AFTER or DERIVED FROM the subject (a poetry movement named for obscurity, a band called Portugal, a surname) scores below 40 even when the chapter seems to fit. A page that never names the subject, or names it once in passing while really being about something else (a political theory book mentioning the subject in one paragraph), scores below 40. File each page into exactly one chapter: {chlist}.");
     let user = format!(
-        "{{\"task\": \"classify\", \"title\": \"{title}\", \"url\": \"{base}\", \"text\": \"{excerpt}\", \"want\": {{\"kind\": \"spec|fault|review|dimensions|facts|howto|reference|history|other\", \"section\": \"one of: {chlist}\", \"bullets\": [\"up to 10 facts\"], \"specs\": [[\"key\", \"value\"] up to 12], \"quotes\": [\"up to 3 verbatim spans\"]}}}}"
+        "{{\"task\": \"classify\", \"title\": \"{title}\", \"url\": \"{base}\", \"text\": \"{excerpt}\", \"want\": {{\"kind\": \"spec|fault|review|dimensions|facts|howto|reference|history|other\", \"relevance\": \"0-100 fit to the subject\", \"section\": \"one of: {chlist}\", \"bullets\": [\"up to 10 facts\"], \"specs\": [[\"key\", \"value\"] up to 12], \"quotes\": [\"up to 3 verbatim spans\"]}}}}"
     );
     let body = serde_json::json!({
         "messages": [{"role": "system", "content": sys}, {"role": "user", "content": user}],
-        "temperature": 0.1,
+        // scoring must be deterministic: llama-server seeds randomly per
+        // boot, and a 0.1 lottery once dropped an entire manual (intake run)
+        "temperature": 0.0,
         "max_tokens": 700,
         "response_format": {"type": "json_object"},
         "tools": [{
@@ -81,7 +86,8 @@ async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, ch
         Some((v, tooled)) => (v, tooled),
         None => {
             let sec = chapters.last().cloned().unwrap_or_else(|| "Other".into());
-            return with_via(heuristic(title, &excerpt), vec![], sec, "heuristic:no-llm");
+            let (k, b, s, q, sec, via) = with_via(heuristic(title, &excerpt), vec![], sec, "heuristic:no-llm");
+            return (k, b, s, q, sec, via, -1);
         }
     };
     let parsed: Option<(String, Vec<String>, Vec<[String; 2]>, Vec<String>, String, bool, i64)> = (|| {
@@ -92,7 +98,10 @@ async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, ch
         // reaches the manual. (60 was tried: qwen3-4b scores canon content
         // in the 40s, so 60 empties the manual. The deterministic chunk gate
         // below is the precise instrument; the LLM gate stays at 40.)
-        let relevance: i64 = v.get("relevance").and_then(|r| r.as_i64()).unwrap_or(50);
+        // relevance gate: unscored is untrusted — a missing field once
+        // defaulted to 50 (keep) and let a scoreless Dugin chunk through.
+        // The want block above now also demands the score, belt and braces.
+        let relevance: i64 = v.get("relevance").and_then(|r| r.as_i64()).unwrap_or(0);
         let bullets: Vec<String> = v
             .get("bullets")
             .and_then(|b| b.as_array())
@@ -145,12 +154,17 @@ async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, ch
         Some((kind, bullets, specs, quotes, section, tooled, relevance))
     })();
     match parsed {
-        Some((k, b, s, q, sec, true, r)) if r >= 40 => (k, b, s, q, sec, format!("{via_tag}:tool")),
-        Some((k, b, s, q, sec, false, r)) if r >= 40 => (k, b, s, q, sec, format!("{via_tag}:json")),
-        Some(_) => return with_via(heuristic(title, &excerpt), vec![], chapters.last().cloned().unwrap_or_else(|| "Other".into()), "heuristic:irrelevant"),
+        Some((k, b, s, q, sec, true, r)) if r >= 40 => (k, b, s, q, sec, format!("{via_tag}:tool"), r),
+        Some((k, b, s, q, sec, false, r)) if r >= 40 => (k, b, s, q, sec, format!("{via_tag}:json"), r),
+        // dropped below: the score travels with the rejection so the log
+        // can tell scoreless (0) from low-scored apart
+        Some((_, _, _, _, _, _, r)) => {
+            let (k, b, s, q, sec, via) = with_via(heuristic(title, &excerpt), vec![], chapters.last().cloned().unwrap_or_else(|| "Other".into()), "heuristic:irrelevant");
+            (k, b, s, q, sec, via, r)
+        }
         None => {
             let (k, b, s) = heuristic(title, &excerpt);
-            (k, b, s, vec![], chapters.last().cloned().unwrap_or_else(|| "Other".into()), "heuristic:parse".into())
+            (k, b, s, vec![], chapters.last().cloned().unwrap_or_else(|| "Other".into()), "heuristic:parse".into(), -1)
         }
     }
 }
@@ -348,7 +362,7 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
         if let Some(tx) = &prog {
             let _ = tx.send(format!("pixie {}/{} {}", n + 1, kept_total, url.chars().take(50).collect::<String>()));
         }
-        let (kind, bullets, specs, quotes, section, via) = process_one(&client, &endpoint, &via_tag, &chapters, &meaning, &query, &url, &title, &text).await;
+        let (kind, bullets, specs, quotes, section, via, relevance) = process_one(&client, &endpoint, &via_tag, &chapters, &meaning, &query, &url, &title, &text).await;
         // namesake filter: parenthetical disambiguators that never belong
         // in a subject manual (bands, surnames, albums share query words)
         let tl = title.to_lowercase();
@@ -370,13 +384,13 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
         // relevance gate: model-scored <40 never reaches the manual
         if via == "heuristic:irrelevant" {
             if let Some(tx) = &prog {
-                let _ = tx.send(format!("drop irrelevant: {}", title.chars().take(50).collect::<String>()));
+                let _ = tx.send(format!("drop irrelevant ({}): {}", relevance, title.chars().take(50).collect::<String>()));
             }
             keeper_at[i] = None;
             dropped_irrelevant += 1;
             continue;
         }
-        entries.push(Entry { url, title, kind, via, bullets, specs, quotes, section, claimed_by: 0 });
+        entries.push(Entry { url, title, kind, via, bullets, specs, quotes, section, claimed_by: 0, relevance });
     }
     // second pass: attribute dups to their keepers (entries index space)
     for p in arr.iter() {
