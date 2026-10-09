@@ -281,28 +281,153 @@ pub fn extract_text(html: &str) -> (String, String) {
 }
 
 async fn fetch_one(url: &str) -> Result<Page> {
-    let c = client();
-    let r = c
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| MagpieError::Network(e.to_string()))?;
-    if !r.status().is_success() {
-        return Err(MagpieError::Network(format!("{} {}", r.status(), url)));
+    // thin wrapper: the record is already ledgered inside fetch_measured,
+    // so wiki/judge/second-hop fetches count as data too, not just the
+    // crawl_urls ring
+    let (res, rec) = fetch_measured(url).await;
+    crate::db::append("fetch", serde_json::to_value(&rec).unwrap_or_default());
+    res
+}
+
+/// One ledger line per fetch attempt-chain. Failures are data: throttles,
+/// blocks and dead hosts are what the next run plans around.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FetchRecord {
+    pub url: String,
+    pub host: String,
+    /// ok | thin | fail | robots | non-html | bulk
+    pub outcome: String,
+    pub status: Option<u16>,
+    pub bytes: u64,
+    pub ms: u64,
+    pub attempts: u8,
+    pub note: String,
+}
+
+/// Per-host roll-up for seek.log and seek.json: (host, ok, fail, other, median_ms)
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FetchHost {
+    pub host: String,
+    pub ok: usize,
+    pub fail: usize,
+    pub other: usize,
+    pub ms_med: u64,
+}
+
+pub fn summarize_fetches(recs: &[FetchRecord]) -> Vec<FetchHost> {
+    let mut by_host: std::collections::HashMap<String, Vec<&FetchRecord>> = Default::default();
+    for r in recs {
+        by_host.entry(r.host.clone()).or_default().push(r);
     }
-    let html = r
-        .text()
-        .await
-        .map_err(|e| MagpieError::Network(e.to_string()))?;
-    let (title, text) = extract_text(&html);
-    let chars = text.chars().count();
-    Ok(Page {
+    let mut out: Vec<FetchHost> = by_host
+        .into_iter()
+        .map(|(host, rs)| {
+            let ok = rs.iter().filter(|r| r.outcome == "ok").count();
+            let fail = rs.iter().filter(|r| r.outcome == "fail").count();
+            let other = rs.len() - ok - fail;
+            let mut ms: Vec<u64> = rs.iter().map(|r| r.ms).collect();
+            ms.sort_unstable();
+            let ms_med = ms.get(ms.len() / 2).copied().unwrap_or(0);
+            FetchHost { host, ok, fail, other, ms_med }
+        })
+        .collect();
+    out.sort_by(|a, b| b.ok.cmp(&a.ok).then(a.host.cmp(&b.host)));
+    out
+}
+
+async fn fetch_measured(url: &str) -> (Result<Page>, FetchRecord) {
+    let host = host_of(url);
+    let t0 = std::time::Instant::now();
+    let c = client();
+    let mut attempts = 0u8;
+    let mut status: Option<u16> = None;
+    let mut note = String::new();
+    // one retry, only for throttles/overload: 429/503 recover if out-waited
+    // (DDG/Marginalia throttle this IP intermittently). 4xx never retried.
+    for _ in 0..2 {
+        attempts += 1;
+        match c.get(url).send().await {
+            Ok(r) => {
+                let st = r.status().as_u16();
+                status = Some(st);
+                if st == 429 || st == 503 {
+                    note = format!("{st} throttle");
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+                if !r.status().is_success() {
+                    note = format!("{st}");
+                    break;
+                }
+                let ctype = r
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                // non-HTML bodies (PDF/epub/images): ledger, never ingest
+                // as text (r.text() on a PDF is mojibake, not content)
+                if !ctype.is_empty()
+                    && !ctype.contains("html")
+                    && !ctype.contains("text")
+                    && !ctype.contains("xml")
+                    && !ctype.contains("json")
+                {
+                    let rec = FetchRecord {
+                        url: url.to_string(),
+                        host,
+                        outcome: "non-html".into(),
+                        status,
+                        bytes: 0,
+                        ms: t0.elapsed().as_millis() as u64,
+                        attempts,
+                        note: ctype.chars().take(60).collect(),
+                    };
+                    return (Err(MagpieError::Network(format!("non-html {ctype} {url}"))), rec);
+                }
+                let html = match r.text().await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        note = format!("body:{e}");
+                        break;
+                    }
+                };
+                let bytes = html.len() as u64;
+                let (title, text) = extract_text(&html);
+                let chars = text.chars().count();
+                let rec = FetchRecord {
+                    url: url.to_string(),
+                    host,
+                    outcome: "ok".into(),
+                    status,
+                    bytes,
+                    ms: t0.elapsed().as_millis() as u64,
+                    attempts,
+                    note: format!("{chars}c"),
+                };
+                return (
+                    Ok(Page { url: url.to_string(), title, text: text.clone(), chars, dup_of: None }),
+                    rec,
+                );
+            }
+            Err(e) => {
+                // connect/dns/timeout: one retry after a breath
+                note = format!("net:{}", e.to_string().chars().take(80).collect::<String>());
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+    }
+    let rec = FetchRecord {
         url: url.to_string(),
-        title,
-        text: text.clone(),
-        chars,
-        dup_of: None,
-    })
+        host,
+        outcome: "fail".into(),
+        status,
+        bytes: 0,
+        ms: t0.elapsed().as_millis() as u64,
+        attempts,
+        note,
+    };
+    (Err(MagpieError::Network(format!("{} {url}", rec.note))), rec)
 }
 
 fn extract_hrefs(html: &str) -> Vec<String> {
@@ -1909,7 +2034,7 @@ async fn robots_allows(url: &str) -> bool {
     ok
 }
 
-pub async fn crawl_urls(urls: &[String], prog: Option<tokio::sync::mpsc::UnboundedSender<String>>) -> Vec<Page> {
+pub async fn crawl_urls(urls: &[String], prog: Option<tokio::sync::mpsc::UnboundedSender<String>>) -> (Vec<Page>, Vec<FetchRecord>) {
     use std::sync::Arc;
     use tokio::sync::Semaphore;
     // 3 concurrent fetches, 250ms launch pacing: fast but polite.
@@ -1933,16 +2058,30 @@ pub async fn crawl_urls(urls: &[String], prog: Option<tokio::sync::mpsc::Unbound
                 if let Some(tx) = &prog {
                     let _ = tx.send(format!("skip {}/{} (robots)", i + 1, total));
                 }
-                return None;
+                let rec = FetchRecord {
+                    url: u.clone(),
+                    host: host_of(&u),
+                    outcome: "robots".into(),
+                    status: None,
+                    bytes: 0,
+                    ms: 0,
+                    attempts: 0,
+                    note: "disallow".into(),
+                };
+                crate::db::append("fetch", serde_json::to_value(&rec).unwrap_or_default());
+                return (None, Some(rec));
             }
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            match fetch_one(&u).await {
-                Ok(p) => {
+            match fetch_measured(&u).await {
+                (Ok(p), rec) => {
                     if p.text.chars().count() < 200 {
                         if let Some(tx) = &prog {
                             let _ = tx.send(format!("skip {}/{} (thin)", i + 1, total));
                         }
-                        return None;
+                        let mut rec = rec;
+                        rec.outcome = "thin".into();
+                        crate::db::append("fetch", serde_json::to_value(&rec).unwrap_or_default());
+                        return (None, Some(rec));
                     }
                     // raw reserve: extracted text persisted for later
                     // rinse/filter passes (TBs spare, keep everything)
@@ -1950,30 +2089,39 @@ pub async fn crawl_urls(urls: &[String], prog: Option<tokio::sync::mpsc::Unbound
                         "crawl",
                         serde_json::json!({"url": p.url, "title": p.title, "chars": p.chars, "text": p.text}),
                     );
+                    crate::db::append("fetch", serde_json::to_value(&rec).unwrap_or_default());
                     if let Some(tx) = &prog {
                         let _ = tx.send(format!("got {}/{} {}c", i + 1, total, p.chars));
                     }
-                    Some((i, p))
+                    (Some((i, p)), Some(rec))
                 }
-                Err(_) => {
+                (Err(_), rec) => {
+                    crate::db::append("fetch", serde_json::to_value(&rec).unwrap_or_default());
                     if let Some(tx) = &prog {
-                        let _ = tx.send(format!("fail {}/{}", i + 1, total));
+                        let _ = tx.send(format!("fail {}/{} ({} {})", i + 1, total, rec.status.map(|s| s.to_string()).unwrap_or_else(|| "net".into()), rec.note.chars().take(30).collect::<String>()));
                     }
-                    None
+                    (None, Some(rec))
                 }
             }
         }));
     }
     let mut out: Vec<(usize, Page)> = vec![];
+    let mut recs: Vec<FetchRecord> = vec![];
     for h in handles {
-        if let Ok(Some(p)) = h.await {
-            out.push(p);
+        if let Ok((page, rec)) = h.await {
+            if let Some(r) = rec {
+                recs.push(r);
+            }
+            if let Some(p) = page {
+                out.push(p);
+            }
         }
     }
     // restore plan order (progress may arrive out of order; order matters
     // for dup_of indices and ring-budget expectations)
     out.sort_by_key(|(i, _)| *i);
-    out.into_iter().map(|(_, p)| p).collect()
+    recs.sort_by(|a, b| a.url.cmp(&b.url));
+    (out.into_iter().map(|(_, p)| p).collect(), recs)
 }
 
 fn host_of(u: &str) -> String {
@@ -2192,5 +2340,40 @@ mod tests {
             book_about_subject("Corpus Hermeticum — Internet Archive", &head, &text.to_lowercase(), &lex),
             "canon volume rejected"
         );
+    }
+}
+
+#[cfg(test)]
+mod ledger_tests {
+    use super::{summarize_fetches, FetchRecord};
+
+    fn rec(host: &str, outcome: &str, ms: u64) -> FetchRecord {
+        FetchRecord {
+            url: format!("https://{host}/x"),
+            host: host.into(),
+            outcome: outcome.into(),
+            status: Some(200),
+            bytes: 100,
+            ms,
+            attempts: 1,
+            note: String::new(),
+        }
+    }
+
+    #[test]
+    fn ledger_rolls_up_per_host() {
+        let rs = vec![
+            rec("a.example", "ok", 100),
+            rec("a.example", "ok", 300),
+            rec("a.example", "fail", 50),
+            rec("b.example", "robots", 0),
+        ];
+        let s = summarize_fetches(&rs);
+        assert_eq!(s.len(), 2);
+        let a = s.iter().find(|f| f.host == "a.example").unwrap();
+        assert_eq!((a.ok, a.fail, a.other), (2, 1, 0));
+        assert_eq!(a.ms_med, 100);
+        let b = s.iter().find(|f| f.host == "b.example").unwrap();
+        assert_eq!((b.ok, b.fail, b.other), (0, 0, 1));
     }
 }

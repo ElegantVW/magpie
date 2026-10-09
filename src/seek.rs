@@ -1,4 +1,4 @@
-use crate::crawl::{crawl_urls, expand_second_hop, plan_urls, Page, QueryCard};
+use crate::crawl::{crawl_urls, expand_second_hop, plan_urls, FetchHost, Page, QueryCard};
 use crate::error::{MagpieError, Result};
 use crate::pdf::render_pdf;
 use crate::store::seek_dir;
@@ -16,6 +16,10 @@ pub struct SeekDoc {
     pub pages: Vec<Page>,
     pub hosts: Vec<String>,
     pub warnings: Vec<String>,
+    /// per-host fetch roll-up (ok/fail/other + median ms) — the ledger's
+    /// summary lives with the run; full rows in fetch.jsonl + db
+    #[serde(default)]
+    pub fetch_summary: Vec<FetchHost>,
 }
 
 fn norm_words(t: &str) -> HashSet<String> {
@@ -163,7 +167,7 @@ pub async fn run_seek_with_progress(
     if let Some(tx) = &prog {
         let _ = tx.send(format!("crawling {} urls…", plan.urls.len()));
     }
-    let mut pages = crawl_urls(&plan.urls, prog.clone()).await;
+    let (mut pages, mut frecs) = crawl_urls(&plan.urls, prog.clone()).await;
     // bulk legs already fetched content (WARC, structured APIs): merge in
     let n_pre = plan.prefetched.len();
     // raw reserve: bulk legs never pass through crawl_urls' archive, so
@@ -190,7 +194,8 @@ pub async fn run_seek_with_progress(
             if let Some(tx) = &prog {
                 let _ = tx.send(format!("crawling {} extra urls…", extra.len()));
             }
-            let mut more = crawl_urls(&extra, prog.clone()).await;
+            let (mut more, mut more_recs) = crawl_urls(&extra, prog.clone()).await;
+            frecs.append(&mut more_recs);
             pages.append(&mut more);
         }
     }
@@ -263,7 +268,19 @@ pub async fn run_seek_with_progress(
         pages,
         hosts,
         warnings,
+        fetch_summary: crate::crawl::summarize_fetches(&frecs),
     };
+
+    // fetch ledger per run: one JSON line per attempt-chain (failures are
+    // data — the next run plans around throttles and dead hosts)
+    {
+        let mut buf = String::new();
+        for r in &frecs {
+            buf.push_str(&serde_json::to_string(r).unwrap_or_default());
+            buf.push('\n');
+        }
+        let _ = std::fs::write(dir.join("fetch.jsonl"), buf);
+    }
 
     let json_path = dir.join("seek.json");
     let s = serde_json::to_string_pretty(&doc).map_err(|e| MagpieError::Io(e.to_string()))?;
@@ -301,10 +318,16 @@ pub async fn run_seek_with_progress(
         .map(|(l, n)| format!("{l}={n}"))
         .collect::<Vec<_>>()
         .join(" ");
+    let fetch_line = doc
+        .fetch_summary
+        .iter()
+        .map(|f| format!("{}(ok:{} fail:{} other:{} {}ms)", f.host, f.ok, f.fail, f.other, f.ms_med))
+        .collect::<Vec<_>>()
+        .join(" ");
     let _ = std::fs::write(
         dir.join("seek.log"),
         format!(
-            "query={}\ndepth={}\ncreated={}\ncard={} | {} | aliases={:?}\nlegs: {}\npages={} hosts={:?}\nwarnings={:?}\n",
+            "query={}\ndepth={}\ncreated={}\ncard={} | {} | aliases={:?}\nlegs: {}\npages={} hosts={:?}\nfetch: {}\nwarnings={:?}\n",
             doc.query,
             doc.depth,
             doc.created,
@@ -314,6 +337,7 @@ pub async fn run_seek_with_progress(
             legs_line,
             doc.pages.len(),
             doc.hosts,
+            fetch_line,
             doc.warnings
         ),
     );
