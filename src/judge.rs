@@ -64,6 +64,43 @@ pub async fn run_judge(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc::
     let v: serde_json::Value = serde_json::from_str(&raw).map_err(|e| MagpieError::Parse(e.to_string()))?;
     let query = v.get("query").and_then(|q| q.as_str()).unwrap_or("seek").to_string();
     let entries = v.get("entries").and_then(|e| e.as_array()).cloned().unwrap_or_default();
+    // unscored manuals are not judged: fact-checking heuristic fallback
+    // bullets wastes inference on content the producer pass never scored.
+    // (A slow-day timeout once filled a whole manual with heuristic:no-llm.)
+    {
+        let h = entries
+            .iter()
+            .filter(|e| e.get("via").and_then(|x| x.as_str()).map(|s| s.starts_with("heuristic")).unwrap_or(false))
+            .count();
+        if !entries.is_empty() && h * 2 > entries.len() {
+            let comment = format!(
+                "producer pass failed: {h}/{} entries unscored (heuristic fallback) — fix inference health, reprocess, then re-judge",
+                entries.len()
+            );
+            let record = serde_json::json!({
+                "query": query,
+                "overall": "REDO",
+                "comment": comment,
+                "via": "heuristic:unscored",
+                "verdicts": [],
+                "searches": 0,
+            });
+            std::fs::write(dir.join("judgment.json"), serde_json::to_string_pretty(&record).unwrap()).map_err(|e| MagpieError::Io(e.to_string()))?;
+            std::fs::write(dir.join("judgment.txt"), format!("JUDGMENT: REDO (heuristic:unscored)\n{comment}\n")).map_err(|e| MagpieError::Io(e.to_string()))?;
+            crate::db::append_subject(
+                &query,
+                "quarantine",
+                serde_json::json!({"title": format!("{query} — manual"), "leg": "judge", "reason": format!("REDO unscored: {comment}")}),
+            );
+            crate::db::manifest_stage(
+                &dir,
+                "judge",
+                serde_json::json!({"overall": "REDO", "via": "heuristic:unscored", "searches": 0}),
+            );
+            send("judge: REDO (unscored manual, no searches spent)");
+            return Ok(dir);
+        }
+    }
     let claims = top_claims(&entries);
     if claims.is_empty() {
         return Err(MagpieError::Parse("no checkable claims".into()));
@@ -89,7 +126,7 @@ pub async fn run_judge(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc::
     }
     // one judge call over all pairs
     let (endpoint, via_tag) = crate::llm::llm_endpoint().await;
-    // no client-level timeout: chat_once governs (150s send / 30s body).
+    // no client-level timeout: chat_once governs (600s send / 60s body).
     // The deliberation payload is ~12KB of evidence; 30s was too tight.
     let client = reqwest::Client::new();
     let sys = "You are the judge of a researched manual. For each claim, verdict supported|contested|unverified from the evidence. Then overall APPROVED or REDO. Reply ONLY JSON.";
@@ -289,5 +326,36 @@ mod tests {
         for must in ["UNIQUEQUOTE", "UNIQUEBULLET", "uniquekey", "uniquevalue", "UNIQUEINTRO", "UNIQUECOMMENT", "Judge"] {
             assert!(txt.contains(must), "re-render lost {must:?}:\n{txt}");
         }
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::run_judge;
+
+    #[tokio::test]
+    async fn unscored_manual_redos_without_searches() {
+        let dir = tempfile::tempdir().unwrap();
+        let doc = serde_json::json!({
+            "query": "slowday",
+            "entries": [
+                {"kind": "other", "title": "A", "url": "https://a.example", "via": "heuristic:no-llm",
+                 "bullets": ["x"], "specs": [], "quotes": [], "section": "Facts", "claimed_by": 0, "relevance": -1},
+                {"kind": "other", "title": "B", "url": "https://b.example", "via": "heuristic:no-llm",
+                 "bullets": ["y"], "specs": [], "quotes": [], "section": "Facts", "claimed_by": 0, "relevance": -1},
+                {"kind": "facts", "title": "C", "url": "https://c.example", "via": "llm:test:json",
+                 "bullets": ["z fact with enough length to check"], "specs": [], "quotes": [], "section": "Facts", "claimed_by": 0, "relevance": 90}
+            ]
+        });
+        std::fs::write(dir.path().join("processed.json"), serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+        let out = run_judge(dir.path().to_path_buf(), None).await.unwrap();
+        assert_eq!(out, dir.path().to_path_buf());
+        let rec: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("judgment.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rec.get("overall").and_then(|o| o.as_str()), Some("REDO"));
+        assert_eq!(rec.get("via").and_then(|x| x.as_str()), Some("heuristic:unscored"));
+        assert_eq!(rec.get("searches").and_then(|s| s.as_u64()), Some(0), "no searches spent on unscored");
     }
 }

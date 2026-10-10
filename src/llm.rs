@@ -50,15 +50,19 @@ pub async fn llm_endpoint() -> (String, String) {
 
 /// One quick LLM round-trip. llama-server answers after full generation
 /// (no stream), so budgets must cover CPU prompt eval + generation.
+/// Floor math (measured): 700 output tokens at a bad-day 3 tok/s ≈ 233s
+/// + prompt eval. A 150s budget once failed EVERY keeper on a slow day
+/// (4 tok/s → 175s > 150s → whole manual silently heuristic). Budgets are
+/// generous on purpose: too-short is catastrophic, too-long is waiting.
 pub async fn chat_once(client: &reqwest::Client, url: &str, body: &serde_json::Value) -> std::result::Result<String, String> {
     let resp = tokio::time::timeout(
-        std::time::Duration::from_secs(150),
+        std::time::Duration::from_secs(600),
         client.post(url).json(body).send(),
     )
     .await
     .map_err(|e| format!("send:{e}"))?
     .map_err(|e| format!("send:{e}"))?;
-    tokio::time::timeout(std::time::Duration::from_secs(30), resp.text())
+    tokio::time::timeout(std::time::Duration::from_secs(60), resp.text())
         .await
         .map_err(|e| format!("body:{e}"))?
         .map_err(|e| format!("body:{e}"))

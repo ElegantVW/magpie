@@ -420,6 +420,17 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
     for (ei, e) in entries.iter_mut().enumerate() {
         e.claimed_by = *corrobor.get(&ei).unwrap_or(&0);
     }
+    let heuristic_n = entries.iter().filter(|e| e.via.starts_with("heuristic")).count();
+    let mut proc_warnings: Vec<String> = vec![];
+    // truthfulness: an unscored manual must SAY so. If the LLM pass mostly
+    // failed (slow-day timeouts once filled a whole manual with heuristic
+    // entries), the manual is a heuristic draft, not a produced manual.
+    if !entries.is_empty() && heuristic_n * 2 > entries.len() {
+        proc_warnings.push(format!(
+            "{heuristic_n}/{} entries unscored (LLM pass failed) — heuristic draft, reprocess when inference is healthy",
+            entries.len()
+        ));
+    }
     let out = serde_json::json!({
         "query": query,
         "title": format!("{query} — manual"),
@@ -427,6 +438,7 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
         "chapters": chapters,
         "entries": entries,
         "dropped_irrelevant": dropped_irrelevant,
+        "warnings": proc_warnings.clone(),
     });
     std::fs::write(dir.join("processed.json"), serde_json::to_string_pretty(&out).unwrap()).map_err(|e| MagpieError::Io(e.to_string()))?;
     // synthesis pass: one clearly-marked generated intro per covered
@@ -486,6 +498,7 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
         "entries": entries,
         "intros": intros.iter().map(|(k, (t, v))| (k.clone(), serde_json::json!({"text": t, "via": v}))).collect::<serde_json::Map<String, serde_json::Value>>(),
         "dropped_irrelevant": dropped_irrelevant,
+        "warnings": proc_warnings,
     });
     std::fs::write(dir.join("processed.json"), serde_json::to_string_pretty(&out).unwrap()).map_err(|e| MagpieError::Io(e.to_string()))?;
     if let Some(tx) = &prog {
