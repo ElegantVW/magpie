@@ -27,6 +27,7 @@ crossterm = "0.28"
 url = "2"
 regex = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+sha2 = "0.10"
 html-escape = "0.2"
 anyhow = "1"
 flate2 = "1"

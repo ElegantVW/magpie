@@ -141,7 +141,27 @@ pub async fn run_judge(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc::
             let _ = tx.send("judge: appending verdict…".into());
         }
         append_verdict(&dir, &query, &comment)?;
+    } else {
+        // REDO quarantines the manual itself: refused output with reasons,
+        // filed under the subject like any refused work
+        crate::db::append_subject(
+            &query,
+            "quarantine",
+            serde_json::json!({"title": format!("{query} — manual"), "leg": "judge", "reason": format!("REDO: {}", comment.chars().take(200).collect::<String>())}),
+        );
     }
+    // manifest stage judge: the chain is complete
+    // (claim → entry → page → fetch → run → verdict)
+    crate::db::manifest_stage(
+        &dir,
+        "judge",
+        serde_json::json!({
+            "overall": overall,
+            "judgment.json": crate::db::sha_file(&dir.join("judgment.json")),
+            "manual.pdf": crate::db::sha_file(&dir.join("manual.pdf")),
+            "searches": pairs.len(),
+        }),
+    );
     Ok(dir)
 }
 

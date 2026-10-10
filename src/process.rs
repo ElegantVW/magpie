@@ -341,6 +341,9 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
         }
     }
     let mut dropped_irrelevant = 0;
+    // drops with reasons: the run's other quarantine (intake refuses works,
+    // process refuses chunks). Persisted to drops.json, not just counted.
+    let mut drops: Vec<serde_json::Value> = vec![];
     // corroboration map: keeper index -> dup count (dups skip the LLM pass)
     let mut corrobor: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     // index map: seek.json page position -> entries position (keepers only)
@@ -379,6 +382,7 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
             }
             keeper_at[i] = None;
             dropped_irrelevant += 1;
+            drops.push(serde_json::json!({"title": title, "url": url, "reason": "namesake"}));
             continue;
         }
         // relevance gate: model-scored <40 never reaches the manual
@@ -388,6 +392,7 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
             }
             keeper_at[i] = None;
             dropped_irrelevant += 1;
+            drops.push(serde_json::json!({"title": title, "url": url, "reason": format!("relevance:{relevance}")}));
             continue;
         }
         entries.push(Entry { url, title, kind, via, bullets, specs, quotes, section, claimed_by: 0, relevance });
@@ -494,6 +499,20 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
         h
     };
     crate::pdf::render_manual(&query, &chapters, &intros, &mentries, &hosts, &dir.join("manual.pdf"))?;
+    // drops file + manifest stage: the manual's provenance chain gains
+    // its process link (entries kept, chunks refused with scores)
+    let _ = std::fs::write(&dir.join("drops.json"), serde_json::to_string_pretty(&drops).unwrap_or_default());
+    crate::db::manifest_stage(
+        &dir,
+        "process",
+        serde_json::json!({
+            "processed.json": crate::db::sha_file(&dir.join("processed.json")),
+            "manual.pdf": crate::db::sha_file(&dir.join("manual.pdf")),
+            "drops.json": crate::db::sha_file(&dir.join("drops.json")),
+            "entries": entries.len(),
+            "dropped": dropped_irrelevant,
+        }),
+    );
     if let Some(tx) = &prog {
         let _ = tx.send("done".into());
     }

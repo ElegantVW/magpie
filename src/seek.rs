@@ -1,4 +1,4 @@
-use crate::crawl::{crawl_urls, expand_second_hop, plan_urls, FetchHost, Page, QueryCard};
+use crate::crawl::{crawl_urls, expand_second_hop, plan_urls, FetchHost, Page, Quarantine, QueryCard};
 use crate::error::{MagpieError, Result};
 use crate::pdf::render_pdf;
 use crate::store::seek_dir;
@@ -20,6 +20,9 @@ pub struct SeekDoc {
     /// summary lives with the run; full rows in fetch.jsonl + db
     #[serde(default)]
     pub fetch_summary: Vec<FetchHost>,
+    /// refused works with reasons (quarantine file mirrors this)
+    #[serde(default)]
+    pub quarantine: Vec<Quarantine>,
 }
 
 fn norm_words(t: &str) -> HashSet<String> {
@@ -269,7 +272,24 @@ pub async fn run_seek_with_progress(
         hosts,
         warnings,
         fetch_summary: crate::crawl::summarize_fetches(&frecs),
+        quarantine: plan.quarantine.clone(),
     };
+
+    // quarantine: refused works with reasons — per-run file plus the
+    // subject partition (quarantine is auditable, trust is not)
+    {
+        let _ = std::fs::write(
+            dir.join("quarantine.json"),
+            serde_json::to_string_pretty(&doc.quarantine).unwrap_or_default(),
+        );
+        for q in doc.quarantine.iter() {
+            crate::db::append_subject(
+                &query,
+                "quarantine",
+                serde_json::json!({"title": q.title, "url": q.url, "leg": q.leg, "reason": q.reason}),
+            );
+        }
+    }
 
     // fetch ledger per run: one JSON line per attempt-chain (failures are
     // data — the next run plans around throttles and dead hosts)
@@ -327,7 +347,7 @@ pub async fn run_seek_with_progress(
     let _ = std::fs::write(
         dir.join("seek.log"),
         format!(
-            "query={}\ndepth={}\ncreated={}\ncard={} | {} | aliases={:?}\nlegs: {}\npages={} hosts={:?}\nfetch: {}\nwarnings={:?}\n",
+            "query={}\ndepth={}\ncreated={}\ncard={} | {} | aliases={:?}\nlegs: {}\npages={} hosts={:?}\nfetch: {}\nrefused={}\nwarnings={:?}\n",
             doc.query,
             doc.depth,
             doc.created,
@@ -338,8 +358,26 @@ pub async fn run_seek_with_progress(
             doc.pages.len(),
             doc.hosts,
             fetch_line,
+            doc.quarantine.len(),
             doc.warnings
         ),
+    );
+
+    // manifest stage seek: pin every artifact by hash so any claim
+    // traces to exact bytes (claim → entry → page → fetch → run)
+    crate::db::manifest_stage(
+        &dir,
+        "seek",
+        serde_json::json!({
+            "query": doc.query,
+            "subject": doc.query_card.subject,
+            "seek.json": crate::db::sha_file(&dir.join("seek.json")),
+            "fetch.jsonl": crate::db::sha_file(&dir.join("fetch.jsonl")),
+            "quarantine.json": crate::db::sha_file(&dir.join("quarantine.json")),
+            "dump.pdf": crate::db::sha_file(&dir.join("dump.pdf")),
+            "pages": doc.pages.len(),
+            "refused": doc.quarantine.len(),
+        }),
     );
 
     if let Some(tx) = &prog {

@@ -673,12 +673,23 @@ pub fn chapter_queries(query: &str, domain: &str) -> Vec<String> {
     parts.iter().map(|c| format!("{query} {c}")).collect()
 }
 
+/// A rejected work: quarantined, never deleted, reason on file.
+/// Dugin goes here with "off-subject" attached — the next run (or the
+/// rinse pass) can audit refusals instead of trusting them.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Quarantine {
+    pub title: String,
+    pub url: String,
+    pub leg: String,
+    pub reason: String,
+}
+
 /// Internet Archive books: public-domain/open full text only.
 /// advancedsearch → metadata (confirm `_djvu.txt` exists) → download.
 /// Lending-library and restricted items never qualify — listed, never fetched.
 /// `search_q` is the IA query (may be chapter-augmented); gating always uses
 /// the SUBJECT lexicon (original query + card), never the augmented string.
-async fn ia_books(search_q: &str, subject_q: &str, card: &QueryCard, prog: &Option<tokio::sync::mpsc::UnboundedSender<String>>, max_books: usize) -> Vec<Page> {
+async fn ia_books(search_q: &str, subject_q: &str, card: &QueryCard, prog: &Option<tokio::sync::mpsc::UnboundedSender<String>>, max_books: usize) -> (Vec<Page>, Vec<Quarantine>) {
     let send = |m: &str| {
         if let Some(tx) = prog {
             let _ = tx.send(m.to_string());
@@ -692,14 +703,24 @@ async fn ia_books(search_q: &str, subject_q: &str, card: &QueryCard, prog: &Opti
     );
     let txt = match c.get(&q).send().await {
         Ok(r) => r.text().await.unwrap_or_default(),
-        Err(_) => return vec![],
+        Err(_) => return (vec![], vec![]),
     };
     let v: serde_json::Value = match serde_json::from_str(&txt) {
         Ok(v) => v,
-        Err(_) => return vec![],
+        Err(_) => return (vec![], vec![]),
     };
     let docs = v["response"]["docs"].as_array().cloned().unwrap_or_default();
     let mut out = vec![];
+    let mut refused: Vec<Quarantine> = vec![];
+    // every refusal carries its reason: quarantine is auditable, trust is not
+    let mut refuse = |id: &str, title: &str, reason: String| {
+        refused.push(Quarantine {
+            title: title.to_string(),
+            url: format!("https://archive.org/details/{id}"),
+            leg: "ia-books".into(),
+            reason,
+        });
+    };
     for d in docs {
         if out.len() >= max_books.max(1) {
             break;
@@ -714,7 +735,10 @@ async fn ia_books(search_q: &str, subject_q: &str, card: &QueryCard, prog: &Opti
         // resolve the exact _djvu.txt from the file list, never guess.
         let meta = match c.get(&format!("https://archive.org/metadata/{id}")).send().await {
             Ok(r) => r.text().await.unwrap_or_default(),
-            Err(_) => continue,
+            Err(_) => {
+                refuse(&id, &title, "no-metadata".into());
+                continue;
+            }
         };
         let txt_name: Option<String> = (|| {
             let v: serde_json::Value = serde_json::from_str(&meta).ok()?;
@@ -734,26 +758,35 @@ async fn ia_books(search_q: &str, subject_q: &str, card: &QueryCard, prog: &Opti
         })();
         let txt_name = match txt_name {
             Some(n) => n,
-            None => continue,
+            None => {
+                refuse(&id, &title, "no-fulltext".into());
+                continue;
+            }
         };
         let body = match c.get(&format!("https://archive.org/download/{id}/{txt_name}")).send().await {
             Ok(r) => {
                 // restricted/lending items answer 403 with an error page —
                 // never ingest those as book text
                 if !r.status().is_success() {
+                    refuse(&id, &title, format!("restricted:{}", r.status().as_u16()));
                     continue;
                 }
                 r.text().await.unwrap_or_default()
             }
-            Err(_) => continue,
+            Err(_) => {
+                refuse(&id, &title, "download-failed".into());
+                continue;
+            }
         };
         if body.contains("Page not found on Internet Archive") {
+            refuse(&id, &title, "not-found".into());
             continue;
         }
         // full text, not a sample: books are chunked downstream, and
         // runtime no longer matters more than coverage (cap ~400KB)
         let text: String = body.chars().take(400_000).collect();
         if text.chars().count() < 2000 {
+            refuse(&id, &title, format!("thin:{}c", text.chars().count()));
             continue;
         }
         // intake gate: the whole work must be ABOUT the subject (title or
@@ -766,6 +799,7 @@ async fn ia_books(search_q: &str, subject_q: &str, card: &QueryCard, prog: &Opti
         let head: String = text.chars().take(1500).collect::<String>().to_lowercase();
         if !book_about_subject(&title, &head, &lt, &lex) {
             send(&format!("search: archive.org skip {title} (off-subject)"));
+            refuse(&id, &title, "off-subject".into());
             continue;
         }
         let chars = text.chars().count();
@@ -779,7 +813,7 @@ async fn ia_books(search_q: &str, subject_q: &str, card: &QueryCard, prog: &Opti
         send(&format!("search: archive.org got {title}"));
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
-    out
+    (out, refused)
 }
 
 /// Wikisource: full text of public-domain works (same canon pool as IA).
@@ -1542,6 +1576,9 @@ pub struct CrawlPlan {
     /// per-language query forms: (lang, label, urls found)
     #[serde(default)]
     pub translations: Vec<(String, String, String)>,
+    /// refused works with reasons (quarantine, not deletion)
+    #[serde(default)]
+    pub quarantine: Vec<Quarantine>,
 }
 
 /// Build thorough URL list: DDG + Marginalia + Wikipedia titles.
@@ -1563,6 +1600,7 @@ pub async fn plan_urls(
     };
     let mut urls: Vec<String> = vec![];
     let mut prefetched: Vec<Page> = vec![];
+    let mut plan_quarantine: Vec<Quarantine> = vec![];
     let mut seen = HashSet::new();
     let mut legs: Vec<(String, usize)> = vec![];
 
@@ -1760,8 +1798,11 @@ pub async fn plan_urls(
     // Books run per chapter too (a cookbook for Cuisine, not more history).
     {
         let mark = prefetched.len();
+        let mut refused: Vec<Quarantine> = vec![];
         send("search: books (archive.org)…");
-        for p in ia_books(query, query, &card, &prog, 3).await {
+        let (found, mut r) = ia_books(query, query, &card, &prog, 3).await;
+        refused.append(&mut r);
+        for p in found {
             if spam_url(&p.url) || !seen.insert(canon_url(&p.url)) {
                 continue;
             }
@@ -1774,7 +1815,9 @@ pub async fn plan_urls(
             }
             let bq = format!("{query} {first}");
             send(&format!("search: books ({bq})…"));
-            for p in ia_books(&bq, query, &card, &prog, 1).await {
+            let (found, mut r) = ia_books(&bq, query, &card, &prog, 1).await;
+            refused.append(&mut r);
+            for p in found {
                 if spam_url(&p.url) || !seen.insert(canon_url(&p.url)) {
                     continue;
                 }
@@ -1812,6 +1855,8 @@ pub async fn plan_urls(
             }
         }
         legs.push(("books".into(), prefetched.len() - mark));
+        legs.push(("books-refused".into(), refused.len()));
+        plan_quarantine = refused;
     }
     // entity traversal: top wikidata entities seed their articles
     // ("mixology" -> Cocktail, Bartender, List of cocktails…)
@@ -1983,7 +2028,7 @@ pub async fn plan_urls(
         true
     });
     urls.truncate(max_pages + 8);
-    CrawlPlan { urls, prefetched, legs, query_card: card, expansion: expansion_queries, translations: trans_flat }
+    CrawlPlan { urls, prefetched, legs, query_card: card, expansion: expansion_queries, translations: trans_flat, quarantine: plan_quarantine }
 }
 
 /// robots.txt, cached per host: best-effort Disallow check.

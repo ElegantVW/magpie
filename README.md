@@ -58,6 +58,12 @@ Three AI passes make magpie a producer, not a crawler:
 
 Append-only JSONL reserve under `~/.local/share/magpie/db/` (`MAGPIE_DB` overrides the parent): `dict.jsonl` (Wiktionary extracts), `thesaurus.jsonl` (entity + aliases per query), `translations.jsonl` (per-language hits), `expansions.jsonl` (spawned queries), `crawl.jsonl` (every crawled page's extracted text, keyed by URL). Raw-first, files-first: the house hoards now and rinses later.
 
+## Compartments: quarantine + manifests
+
+Refusals are data, not silence. Every refused work lands in `quarantine.json` per run *and* `db/<subject>/quarantine.jsonl` with its reason (`off-subject`, `no-fulltext`, `restricted:403`, `thin`, relevance score, `REDO: …`). Dugin sits there with cause attached — the rinse pass audits refusals instead of trusting them. Per-chunk drops live in `drops.json` (title, url, `relevance:N` or `namesake`).
+
+Every run carries `manifest.json`, merged stage by stage (seek → process → judge, possibly separate invocations — merge never overwrites): each stage pins its artifacts by SHA256, so any claim traces claim → entry → page → fetch → run → verdict. A re-rendered PDF will not match its hash — honestly.
+
 ## The nose (Xapian)
 
 One BM25 index per subject under `db/<subject>/nose/`, pressed from seek dirs (`fetch.jsonl`-era runs and older alike). Per-doc language from the translation fan-out (stemmers are per-language and never meet — German `Hermetik` is indexed German); aliases + translation labels become synonym pairs both directions, so cross-lingual recall rides on synonyms, not stemming luck. Spelling suggestions compose with synonyms: typo → alias → canon.
