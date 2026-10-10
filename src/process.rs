@@ -293,7 +293,10 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
     if let Some(tx) = &prog {
         let _ = tx.send(format!("model: {endpoint}"));
     }
-    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().map_err(|e| MagpieError::Network(e.to_string()))?;
+    // NO client-level timeout here: chat_once governs (600s send / 60s body).
+    // A 30s client timeout once silently killed every keeper on a slow
+    // inference day (reqwest aborts regardless of the tokio budget above it).
+    let client = reqwest::Client::new();
     if let Some(tx) = &prog {
         let _ = tx.send(format!("subject lexicon ({} tokens), marks: {}", card_lex.len(), marks.join(", ")));
     }
@@ -445,7 +448,9 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
     // chapter (facts stay verbatim in entries; intros are connective tissue)
     let mut intros: std::collections::HashMap<String, (String, String)> = Default::default();
     {
-        let client2 = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().map_err(|e| MagpieError::Network(e.to_string()))?;
+        // no client timeout (see above): synth prompts are small but slow
+        // days are slow everywhere
+        let client2 = reqwest::Client::new();
         for ch in chapters.iter() {
             let facts: Vec<String> = entries
                 .iter()

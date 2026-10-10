@@ -102,7 +102,15 @@ pub async fn chat_json(
         "response_format": {"type": "json_object"},
     });
     let url = format!("{base}/v1/chat/completions", base = endpoint.trim_end_matches('/'));
-    let txt = chat_once(client, &url, &body).await.ok()?;
+    // failures surface on stderr: a silent LLM path once filled a whole
+    // manual with heuristic fallbacks before anyone noticed
+    let txt = match chat_once(client, &url, &body).await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("llm: chat failed: {}", e.chars().take(160).collect::<String>());
+            return None;
+        }
+    };
     match extract_json(&txt) {
         Some(pair) => Some(pair),
         // small models truncate mid-object when the token budget runs out;
