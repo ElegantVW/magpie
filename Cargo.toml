@@ -10,6 +10,12 @@ publish = false
 name = "magpie"
 path = "src/main.rs"
 
+[features]
+# nose: the Xapian nose (needs xapian-core dev files). Default on —
+# this box carries libxapian. Bare boxes: --no-default-features.
+default = ["nose"]
+nose = ["cc", "pkg-config"]
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "io-util", "sync", "process"] }
@@ -24,6 +30,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 html-escape = "0.2"
 anyhow = "1"
 flate2 = "1"
+
+[build-dependencies]
+cc = { version = "1", optional = true }
+pkg-config = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

@@ -37,6 +37,8 @@ magpie seek "query" --depth quick --pages 6 --out /tmp/out --no-pdf
 magpie process /tmp/out        # pixie pass: one quick local AI task per entry, then manual.pdf
 magpie manual "query" --depth deep --pages 12   # end-to-end: dump + manual.pdf
 magpie judge /tmp/out          # fact-check the manual: judgment.json/txt + appendix on APPROVED
+magpie nose --rebuild --subject hermeticism [--dir /tmp/out]  # press the BM25 nose from seek dirs
+magpie nose "hermeticism" --subject hermeticism [--lang de]   # smell the hoard
 magpie browse --dump https://example.com   # compat for pixie
 ```
 
@@ -55,6 +57,14 @@ Three AI passes make magpie a producer, not a crawler:
 ## Programs database
 
 Append-only JSONL reserve under `~/.local/share/magpie/db/` (`MAGPIE_DB` overrides the parent): `dict.jsonl` (Wiktionary extracts), `thesaurus.jsonl` (entity + aliases per query), `translations.jsonl` (per-language hits), `expansions.jsonl` (spawned queries), `crawl.jsonl` (every crawled page's extracted text, keyed by URL). Raw-first, files-first: the house hoards now and rinses later.
+
+## The nose (Xapian)
+
+One BM25 index per subject under `db/<subject>/nose/`, pressed from seek dirs (`fetch.jsonl`-era runs and older alike). Per-doc language from the translation fan-out (stemmers are per-language and never meet — German `Hermetik` is indexed German); aliases + translation labels become synonym pairs both directions, so cross-lingual recall rides on synonyms, not stemming luck. Spelling suggestions compose with synonyms: typo → alias → canon.
+
+Division of labor, stated plainly: the nose ranks lexical fit (a poetry movement named Hermeticism can top the list — it shares the words); meaning stays with the LLM relevance gate and the judge. The nose buries pretenders by density (Dugin: zero hits in the top 30); the gate and judge evict namesakes.
+
+The C++ seam is owned, not depended on: `src/nose_shim.{h,cc}` (~200 lines, exceptions never cross) after all three crates.io bindings proved dead. Needs `xapian-core` dev files (`build.sh` says so plainly); bare boxes build pure Rust with `--no-default-features`.
 
 ## Thoroughness
 
@@ -83,6 +93,7 @@ Python legacy retired to `~/bin/magpie-py-legacy` + `magpie_*.py-legacy`. See CH
 |------|------|
 | `src/main.rs/cli.rs` | CLI: TUI + seek/process/manual/judge + browse --dump compat |
 | `src/llm.rs` | shared local-LLM plumbing: endpoint, JSON enforcement, truncation salvage |
+| `src/nose.rs` + `src/nose_shim.{h,cc}` | Xapian nose: per-subject BM25 index, synonyms, spelling (feature `nose`) |
 | `src/judge.rs` | fact-check pass: claims → verification searches → verdict + appendix |
 | `src/db.rs` | append-only programs database (JSONL under `~/.local/share/magpie/db/`) |
 | `src/crawl.rs` | search chain + fetch + extract + scored second-hop + 30-language fan-out |

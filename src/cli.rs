@@ -75,4 +75,27 @@ pub enum Cmd {
         #[arg(long, default_value_t = 12)]
         pages: usize,
     },
+    /// Smell the hoard: BM25 search over a subject's Xapian nose
+    /// (needs the `nose` cargo feature; rebuilds from seek dirs)
+    #[cfg(feature = "nose")]
+    Nose {
+        /// Search query (omit with --rebuild)
+        query: Option<String>,
+        /// Re-press the index from seek dirs instead of searching
+        #[arg(long, default_value_t = false)]
+        rebuild: bool,
+        /// Subject slug (default: latest seek's query)
+        #[arg(long)]
+        subject: Option<String>,
+        /// Index these seek dirs (repeatable; default: all cache dirs
+        /// matching the subject). Custom --out runs live outside the cache.
+        #[arg(long)]
+        dir: Vec<String>,
+        /// Query language for stemming (ISO code, default en)
+        #[arg(long, default_value = "en")]
+        lang: String,
+        /// Max hits
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
 }

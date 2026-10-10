@@ -3,8 +3,18 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
+# the nose links system Xapian: fail here with a house-style error,
+# not three screens of c++ template noise (or --no-default-features).
+if ! pkg-config --exists xapian-core 2>/dev/null; then
+  echo "note: no xapian-core via pkg-config — building pure-Rust (--no-default-features)" >&2
+  export MAGPIE_NO_NOSE=1
+  NOSE_FLAGS="--no-default-features"
+else
+  NOSE_FLAGS=""
+fi
 # -j1: parallel release trips rustc/ring SIGABRT on this box; single job is green
-cargo build --release -j1
+# shellcheck disable=SC2086
+cargo build --release -j1 $NOSE_FLAGS
 BIN="$ROOT/target/release/magpie"
 echo "built: $BIN"
 ls -la "$BIN"

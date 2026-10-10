@@ -4,6 +4,8 @@ mod db;
 mod error;
 mod judge;
 mod llm;
+#[cfg(feature = "nose")]
+mod nose;
 mod pdf;
 mod process;
 mod seek;
@@ -83,6 +85,40 @@ async fn run(c: Cli) -> anyhow::Result<()> {
         let dir = crate::process::run_process(std::path::PathBuf::from(dir), None).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
         println!("processed -> {}/processed.json", dir.display());
         println!("pdf -> {}/manual.pdf", dir.display());
+        return Ok(());
+    }
+    #[cfg(feature = "nose")]
+    if let Some(Cmd::Nose { query, rebuild, subject, dir, lang, limit }) = c.cmd.clone() {
+        let subject = match subject {
+            Some(s) => s,
+            None => {
+                let dir = crate::store::latest_seek_dir().ok_or_else(|| anyhow::anyhow!("no seeks yet under ~/.cache/magpie/seek/"))?;
+                let raw = std::fs::read_to_string(dir.join("seek.json")).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                let v: serde_json::Value = serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                v.get("query").and_then(|q| q.as_str()).unwrap_or("seek").to_string()
+            }
+        };
+        if rebuild {
+            let dirs: Vec<std::path::PathBuf> = dir.into_iter().map(std::path::PathBuf::from).collect();
+            let (docs, syns) = crate::nose::rebuild(&subject, &dirs, None).map_err(|e| anyhow::anyhow!(e))?;
+            println!("nose: {subject} — {docs} docs, {syns} synonym pairs");
+            return Ok(());
+        }
+        let query = query.ok_or_else(|| anyhow::anyhow!("give a query or --rebuild"))?;
+        let nose = crate::nose::Nose::open(&crate::nose::nose_dir(&subject)).map_err(|e| anyhow::anyhow!(e))?;
+        let slang = crate::nose::xapian_lang(&lang);
+        let hits = nose.search(&query, slang, limit).map_err(|e| anyhow::anyhow!(e))?;
+        if hits.is_empty() {
+            println!("nose: nothing for {query:?} in {subject}");
+        }
+        for (i, (w, u, t)) in hits.iter().enumerate() {
+            println!("{:>2}. [{:.1}] {}\n    {}", i + 1, w, if t.is_empty() { u.clone() } else { t.clone() }, u);
+        }
+        for word in query.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| w.len() > 3) {
+            if let Some(s) = nose.suggest(&word.to_lowercase()) {
+                println!("did you mean: {s} (for {word})");
+            }
+        }
         return Ok(());
     }
     if let Some(Cmd::Seek { query, out, depth, pages, no_pdf }) = c.cmd {
