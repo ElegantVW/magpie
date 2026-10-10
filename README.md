@@ -6,6 +6,8 @@ Rust engine for [faeOS](https://github.com/ElegantVW/faeOS). One binary: TUI + s
 
 Status: TUI prompt box + `seek`/`process`/`manual` + local PDF (`seek.json` + `processed.json` + `dump.pdf`/`manual.pdf`).
 
+For: researchers/students needing a thorough cited PDF. Not for: Google-speed answers, offline boxes with no network/models.
+
 ```
   /\
  (\/)
