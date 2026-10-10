@@ -39,8 +39,14 @@ magpie manual "query" --depth deep --pages 12   # end-to-end: dump + manual.pdf
 magpie judge /tmp/out          # fact-check the manual: judgment.json/txt + appendix on APPROVED
 magpie nose --rebuild --subject hermeticism [--dir /tmp/out]  # press the BM25 nose from seek dirs
 magpie nose "hermeticism" --subject hermeticism [--lang de]   # smell the hoard
+magpie granary --rebuild [--dir /tmp/out]       # press runs into the Parquet granary
+magpie granary --sql "SELECT subject, COUNT(*) FROM pages GROUP BY subject"  # rinse
 magpie browse --dump https://example.com   # compat for pixie
 ```
+
+Features: default builds the Xapian nose (needs `xapian-core` dev files).
+`--no-default-features` builds pure Rust. The granary (DataFusion+Parquet,
+300 crates) is opt-in: `--features granary`.
 
 TUI keys: type + `Enter` seek, `Ctrl-P` pixie pass, `Ctrl-J` judge, `Ctrl-E` entry list (`[kind|via]`), `Ctrl-O` opens the PDF, `Esc` cancel/quit. Plain letters are text now — the old bare `p`/`e` hijacked the first typed character.
 `seek` writes `dump.pdf` (RAW DUMP, never a manual); only `process`/`manual` write `manual.pdf`.
@@ -63,6 +69,26 @@ Append-only JSONL reserve under `~/.local/share/magpie/db/` (`MAGPIE_DB` overrid
 Refusals are data, not silence. Every refused work lands in `quarantine.json` per run *and* `db/<subject>/quarantine.jsonl` with its reason (`off-subject`, `no-fulltext`, `restricted:403`, `thin`, relevance score, `REDO: …`). Dugin sits there with cause attached — the rinse pass audits refusals instead of trusting them. Per-chunk drops live in `drops.json` (title, url, `relevance:N` or `namesake`).
 
 Every run carries `manifest.json`, merged stage by stage (seek → process → judge, possibly separate invocations — merge never overwrites): each stage pins its artifacts by SHA256, so any claim traces claim → entry → page → fetch → run → verdict. A re-rendered PDF will not match its hash — honestly.
+
+## The granary (DataFusion + Parquet)
+
+The loop's food store: every finished run pressed into columnar tables
+(`pages`, `fetch`, `quarantine`, `entries`, `verdicts`, `runs`), each
+hive-partitioned by subject under `db/granary/` so compartments prune
+for free. The amber stays source of truth; the granary is derived and
+re-pressable. `press_run` is the function the future retrieval loop
+calls per cycle: search ends → press → one word out → new search begins.
+
+Rinse examples (the loop auditing itself):
+
+```sql
+-- refusals by reason, per subject
+SELECT subject, reason, COUNT(*) FROM quarantine GROUP BY subject, reason ORDER BY subject;
+-- where the fetches die
+SELECT host, outcome, COUNT(*), AVG(ms) FROM fetch GROUP BY host, outcome ORDER BY host;
+-- score distribution of what reached manuals
+SELECT section, AVG(relevance), COUNT(*) FROM entries GROUP BY section;
+```
 
 ## The nose (Xapian)
 
@@ -100,6 +126,7 @@ Python legacy retired to `~/bin/magpie-py-legacy` + `magpie_*.py-legacy`. See CH
 | `src/main.rs/cli.rs` | CLI: TUI + seek/process/manual/judge + browse --dump compat |
 | `src/llm.rs` | shared local-LLM plumbing: endpoint, JSON enforcement, truncation salvage |
 | `src/nose.rs` + `src/nose_shim.{h,cc}` | Xapian nose: per-subject BM25 index, synonyms, spelling (feature `nose`) |
+| `src/granary.rs` | DataFusion+Parquet lakehouse: press runs, rinse with SQL (feature `granary`) |
 | `src/judge.rs` | fact-check pass: claims → verification searches → verdict + appendix |
 | `src/db.rs` | append-only programs database (JSONL under `~/.local/share/magpie/db/`) |
 | `src/crawl.rs` | search chain + fetch + extract + scored second-hop + 30-language fan-out |

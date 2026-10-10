@@ -2,6 +2,8 @@ mod cli;
 mod crawl;
 mod db;
 mod error;
+#[cfg(feature = "granary")]
+mod granary;
 mod judge;
 mod llm;
 #[cfg(feature = "nose")]
@@ -88,8 +90,7 @@ async fn run(c: Cli) -> anyhow::Result<()> {
         return Ok(());
     }
     #[cfg(feature = "nose")]
-    if let Some(Cmd::Nose { query, rebuild, subject, dir, lang, limit }) = c.cmd.clone() {
-        let subject = match subject {
+    if let Some(Cmd::Nose { query, rebuild, subject, dir, lang, limit }) = c.cmd.clone() {        let subject = match subject {
             Some(s) => s,
             None => {
                 let dir = crate::store::latest_seek_dir().ok_or_else(|| anyhow::anyhow!("no seeks yet under ~/.cache/magpie/seek/"))?;
@@ -119,6 +120,41 @@ async fn run(c: Cli) -> anyhow::Result<()> {
                 println!("did you mean: {s} (for {word})");
             }
         }
+        return Ok(());
+    }
+    #[cfg(feature = "granary")]
+    if let Some(Cmd::Granary { sql, rebuild, dir, limit }) = c.cmd.clone() {
+        if rebuild {
+            // explicit dirs or the whole cache: every finished run pressed
+            let mut dirs: Vec<std::path::PathBuf> = dir.into_iter().map(std::path::PathBuf::from).collect();
+            if dirs.is_empty() {
+                let base = crate::store::cache_dir().join("seek");
+                if let Ok(entries) = std::fs::read_dir(&base) {
+                    for e in entries.flatten().filter(|e| e.path().is_dir()) {
+                        dirs.push(e.path());
+                    }
+                }
+            }
+            let mut tables: std::collections::HashMap<String, usize> = Default::default();
+            for d in dirs {
+                match crate::granary::press_run(&d) {
+                    Ok(rows) => {
+                        for (t, n) in rows {
+                            *tables.entry(t).or_insert(0) += n;
+                        }
+                        println!("pressed {}", d.display());
+                    }
+                    Err(e) => println!("skip {}: {e}", d.display()),
+                }
+            }
+            let mut sum: Vec<(&String, &usize)> = tables.iter().collect();
+            sum.sort();
+            println!("granary: {}", sum.iter().map(|(t, n)| format!("{t}={n}")).collect::<Vec<_>>().join(" "));
+            return Ok(());
+        }
+        let sql = sql.ok_or_else(|| anyhow::anyhow!("give SQL or --rebuild"))?;
+        let (pretty, total) = crate::granary::sql(&sql, limit).await.map_err(|e| anyhow::anyhow!(e))?;
+        println!("{pretty}\n({total} rows)");
         return Ok(());
     }
     if let Some(Cmd::Seek { query, out, depth, pages, no_pdf }) = c.cmd {

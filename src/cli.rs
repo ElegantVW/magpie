@@ -78,8 +78,7 @@ pub enum Cmd {
     /// Smell the hoard: BM25 search over a subject's Xapian nose
     /// (needs the `nose` cargo feature; rebuilds from seek dirs)
     #[cfg(feature = "nose")]
-    Nose {
-        /// Search query (omit with --rebuild)
+    Nose {        /// Search query (omit with --rebuild)
         query: Option<String>,
         /// Re-press the index from seek dirs instead of searching
         #[arg(long, default_value_t = false)]
@@ -96,6 +95,23 @@ pub enum Cmd {
         lang: String,
         /// Max hits
         #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
+    /// Rinse the hoard: press runs into the Parquet granary, query it
+    /// with SQL (needs the `granary` cargo feature)
+    #[cfg(feature = "granary")]
+    Granary {
+        /// SQL to run over the granary (omit with --rebuild)
+        #[arg(long)]
+        sql: Option<String>,
+        /// Press seek dirs into parquet instead of querying
+        #[arg(long, default_value_t = false)]
+        rebuild: bool,
+        /// Press these seek dirs (repeatable; default: all cache dirs)
+        #[arg(long)]
+        dir: Vec<String>,
+        /// Max rows displayed
+        #[arg(long, default_value_t = 20)]
         limit: usize,
     },
 }
