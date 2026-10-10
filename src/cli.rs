@@ -100,8 +100,7 @@ pub enum Cmd {
     /// Rinse the hoard: press runs into the Parquet granary, query it
     /// with SQL (needs the `granary` cargo feature)
     #[cfg(feature = "granary")]
-    Granary {
-        /// SQL to run over the granary (omit with --rebuild)
+    Granary {        /// SQL to run over the granary (omit with --rebuild)
         #[arg(long)]
         sql: Option<String>,
         /// Press seek dirs into parquet instead of querying
@@ -113,5 +112,20 @@ pub enum Cmd {
         /// Max rows displayed
         #[arg(long, default_value_t = 20)]
         limit: usize,
+    },
+    /// Rinse finished runs: simhash near-dups across runs + quarantine
+    /// audit (refused somewhere, kept elsewhere). Text verdict, no LLM.
+    Rinse {
+        /// Audit this subject slug only (default: all runs)
+        #[arg(long)]
+        subject: Option<String>,
+        /// Audit these seek dirs (repeatable; default: all cache dirs)
+        #[arg(long)]
+        dir: Vec<String>,
+        /// Max hamming distance for cross-work near-dups (default 3 of 64
+        /// bits — near-identical only; shared vocabulary collides at 4-6.
+        /// Raise to 6 for resemblance surveys.)
+        #[arg(long, default_value_t = 3)]
+        max_dist: u32,
     },
 }

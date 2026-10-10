@@ -10,6 +10,7 @@ mod llm;
 mod nose;
 mod pdf;
 mod process;
+mod rinse;
 mod seek;
 mod store;
 mod termart;
@@ -163,6 +164,13 @@ async fn run(c: Cli) -> anyhow::Result<()> {
         if !no_pdf {
             println!("dump pdf -> {}/dump.pdf (raw — run `magpie process` for manual.pdf)", dir.display());
         }
+        return Ok(());
+    }
+    if let Some(Cmd::Rinse { subject, dir, max_dist }) = c.cmd.clone() {
+        let dirs: Vec<std::path::PathBuf> = dir.into_iter().map(std::path::PathBuf::from).collect();
+        let runs = crate::rinse::collect_runs(&dirs, subject.as_deref());
+        let report = crate::rinse::audit(&runs, max_dist);
+        print!("{}", crate::rinse::render_report(&report));
         return Ok(());
     }
     // `magpie \"query\"` one-shot

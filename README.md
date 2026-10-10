@@ -39,6 +39,7 @@ magpie seek "query" --depth quick --pages 6 --out /tmp/out --no-pdf
 magpie process /tmp/out        # pixie pass: one quick local AI task per entry, then manual.pdf
 magpie manual "query" --depth deep --pages 12   # end-to-end: dump + manual.pdf
 magpie judge /tmp/out          # fact-check the manual: judgment.json/txt + appendix on APPROVED
+magpie rinse [--subject S] [--dir /tmp/out] [--max-dist 3]  # audit runs: near-dups + quarantine
 magpie nose --rebuild --subject hermeticism [--dir /tmp/out]  # press the BM25 nose from seek dirs
 magpie nose "hermeticism" --subject hermeticism [--lang de]   # smell the hoard
 magpie granary --rebuild [--dir /tmp/out]       # press runs into the Parquet granary
@@ -65,6 +66,15 @@ Three AI passes make magpie a producer, not a crawler:
 ## Programs database
 
 Append-only JSONL reserve under `~/.local/share/magpie/db/` (`MAGPIE_DB` overrides the parent): `dict.jsonl` (Wiktionary extracts), `thesaurus.jsonl` (entity + aliases per query), `translations.jsonl` (per-language hits), `expansions.jsonl` (spawned queries), `crawl.jsonl` (every crawled page's extracted text, keyed by URL). Raw-first, files-first: the house hoards now and rinses later.
+
+## The rinse (audit, no LLM)
+
+`magpie rinse` re-examines finished runs deterministically: trigram-simhash
+near-dups across runs (shared jargon no longer counts — phrases do),
+same-URL re-crawls with seam-stability distances (dist 0 = FastCDC seams
+held), and the quarantine audit (refused somewhere but kept elsewhere
+flags gate instability; sibling-chunk granularity does not flag).
+Reason histograms show what the gates refuse and why. Text verdicts only.
 
 ## Compartments: quarantine + manifests
 
@@ -128,6 +138,7 @@ Python legacy retired to `~/bin/magpie-py-legacy` + `magpie_*.py-legacy`. See CH
 | `src/main.rs/cli.rs` | CLI: TUI + seek/process/manual/judge + browse --dump compat |
 | `src/llm.rs` | shared local-LLM plumbing: endpoint, JSON enforcement, truncation salvage |
 | `src/nose.rs` + `src/nose_shim.{h,cc}` | Xapian nose: per-subject BM25 index, synonyms, spelling (feature `nose`) |
+| `src/rinse.rs` | deterministic audit: trigram-simhash near-dups, quarantine stability |
 | `src/granary.rs` | DataFusion+Parquet lakehouse: press runs, rinse with SQL (feature `granary`) |
 | `src/judge.rs` | fact-check pass: claims → verification searches → verdict + appendix |
 | `src/db.rs` | append-only programs database (JSONL under `~/.local/share/magpie/db/`) |
