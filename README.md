@@ -4,7 +4,7 @@
 
 Rust engine for [faeOS](https://github.com/ElegantVW/faeOS). One binary: TUI + seek + PDF. Privacy-first: DDG + Marginalia, never Google. Thorough by default: many various sources, never wikipedia-only.
 
-Status: TUI prompt box + `seek`/`process`/`manual` + local PDF (`seek.json` + `processed.json` + `dump.pdf`/`manual.pdf`).
+Status: producer of cited PDF manuals — `seek` crawls, `process` files with local AI, `manual` runs end-to-end, `judge` fact-checks, `rinse` audits, `nose`/`granary` query the hoard. (`seek.json` + `processed.json` + `dump.pdf`/`manual.pdf` + `judgment.*` + `quarantine.json` + `drops.json` + `manifest.json` + `fetch.jsonl`).
 
 For: researchers/students needing a thorough cited PDF. Not for: Google-speed answers, offline boxes with no network/models.
 
@@ -23,8 +23,11 @@ llama.cpp is built with Vulkan (`~/.local/src/llama.cpp`, headers in
 `~/.local/lib/llama-vulkan/` (`llama-server-vk` wrapper sets
 `LD_LIBRARY_PATH`); the stock `~/bin/llama-server` is untouched.
 The magpie slot runs `qwen3-4b` on the RX 5700 XT
-(`PIXIE_LLAMA_SERVER=…/llama-server-vk PIXIE_LLM_NGL=99 menagerie set magpie …`):
-~150 tok/s prompt, ~120 tok/s gen — per-entry ~2-10s.
+(`PIXIE_LLAMA_SERVER=…/llama-server-vk PIXIE_LLM_NGL=99 menagerie set magpie …`).
+Per-entry latency follows server speed (fast days well under a minute,
+slow days minutes) — budgets cover bad days (600s LLM round-trips), and
+failures log to stderr, never silent: a 30s client timeout once filled a
+whole manual with unscored fallback entries before anyone noticed.
 `process` passes that env on every `ensure`, so the slot self-heals
 GPU-backed across evictions. Opt out with `MAGPIE_GPU=0`.
 Switch models with `menagerie set magpie <name>`; pick the app with
@@ -53,7 +56,7 @@ Features: default builds the Xapian nose (needs `xapian-core` dev files).
 
 TUI keys: type + `Enter` seek, `Ctrl-P` pixie pass, `Ctrl-J` judge, `Ctrl-E` entry list (`[kind|via]`), `Ctrl-O` opens the PDF, `Esc` cancel/quit. Plain letters are text now — the old bare `p`/`e` hijacked the first typed character.
 `seek` writes `dump.pdf` (RAW DUMP, never a manual); only `process`/`manual` write `manual.pdf`.
-The judge never renders a rejection: REDO leaves the PDF alone and reports reasons as text (`judgment.txt`), so a bad manual costs no local inference to read.
+The judge never renders a rejection: REDO leaves the PDF alone and reports reasons as text (`judgment.txt`), so a bad manual costs no local inference to read. Mostly-unscored manuals REDO without spending searches (fact-checking fallback bullets wastes inference).
 
 ## Producer passes
 
@@ -112,12 +115,12 @@ The C++ seam is owned, not depended on: `src/nose_shim.{h,cc}` (~200 lines, exce
 
 ## Thoroughness
 
-* Chain: DDG HTML POST → old-search Marginalia → Wikipedia family (en/de/pl/it) → `site:` verticals → sitemaps → Common Crawl WARC → Wikidata structured facts
-* Bulk without search engines: sitemap enumeration + CC index→WARC range fetch (gunzip locally) + Wikidata claims API, all keyless
-* Repetition is signal: near-dups kept as `dup_of` corroboration (`claimed_by ×N`), skipped by the LLM pass to save compute; locale mirrors collapse at URL level
+* Chain: DDG HTML POST → old-search Marginalia → Wikipedia family (en/de/pl/it) → `site:` verticals → sitemaps → Common Crawl WARC → Wikidata structured facts → IA books (whole-work intake gate) → 30-language fan-out → scored second-hop
+* Every fetch measured into `fetch.jsonl` (outcome, status, bytes, ms, attempts): throttles retried once, failures kept as data; per-host roll-up in `seek.log`
+* Repetition is signal: near-dups kept as `dup_of` corroboration (`claimed_by ×N`), skipped by the LLM pass to save compute; locale mirrors collapse at URL level; long texts split by FastCDC content-defined seams (stable across re-crawls, verbatim-safe)
 * Gate: warns on `<4 pages`, `<3 hosts`, wiki-only, missing specs/faults. No PDF-only-from-wikipedia claim.
-* Pixie pass via menagerie (`llm:magpie` slot, GPU-backed): one `/v1/chat/completions` JSON-enforced task per keeper entry, each tagged `via: llm:*|heuristic:*` in entries, entries view, cover and sources.
-* Cache: `~/.cache/magpie/seek/<slug>/seek.json`, `processed.json`, `dump.pdf`/`manual.pdf`, `judgment.json`/`judgment.txt`
+* Pixie pass via menagerie (`llm:magpie` slot, GPU-backed): one `/v1/chat/completions` JSON-enforced task per keeper entry at temperature 0 (seed lottery once wiped a manual), each tagged `via: llm:*|heuristic:*` with its score stored in entries, entries view, cover and sources. Distinguishing marks (years, engine codes, proper names) ride the prompt: same-words-different-subject scores below 40; unscored answers default to 0 (drop), never 50.
+* Cache: `~/.cache/magpie/seek/<slug>/seek.json`, `processed.json`, `dump.pdf`/`manual.pdf`, `judgment.json`/`judgment.txt`, `quarantine.json`, `drops.json`, `manifest.json`, `fetch.jsonl`
 * PDF is local minimal writer (Helvetica A4), no LLM in layout, no cloud.
 
 ## Install
@@ -135,16 +138,16 @@ Python legacy retired to `~/bin/magpie-py-legacy` + `magpie_*.py-legacy`. See CH
 
 | Path | Role |
 |------|------|
-| `src/main.rs/cli.rs` | CLI: TUI + seek/process/manual/judge + browse --dump compat |
-| `src/llm.rs` | shared local-LLM plumbing: endpoint, JSON enforcement, truncation salvage |
+| `src/main.rs/cli.rs` | CLI: TUI + seek/process/manual/judge/rinse + nose/granary + browse --dump compat |
+| `src/llm.rs` | shared local-LLM plumbing: endpoint, JSON enforcement, truncation salvage, stderr failures |
 | `src/nose.rs` + `src/nose_shim.{h,cc}` | Xapian nose: per-subject BM25 index, synonyms, spelling (feature `nose`) |
 | `src/rinse.rs` | deterministic audit: trigram-simhash near-dups, quarantine stability |
 | `src/granary.rs` | DataFusion+Parquet lakehouse: press runs, rinse with SQL (feature `granary`) |
-| `src/judge.rs` | fact-check pass: claims → verification searches → verdict + appendix |
-| `src/db.rs` | append-only programs database (JSONL under `~/.local/share/magpie/db/`) |
-| `src/crawl.rs` | search chain + fetch + extract + scored second-hop + 30-language fan-out |
-| `src/seek.rs` | orchestrate + dedupe + diversity gate + dump.pdf |
-| `src/process.rs` | per-entry pixie pass + `via` tagging + manual.pdf |
+| `src/judge.rs` | fact-check pass: claims → verification searches → verdict + appendix; unscored gate |
+| `src/db.rs` | programs database: JSONL amber + subject partitions + SHA manifests |
+| `src/crawl.rs` | search chain + measured fetch + intake gate + lexicon/marks + 30-language fan-out |
+| `src/seek.rs` | orchestrate + FastCDC chunking + dupes + diversity gate + dump.pdf |
+| `src/process.rs` | per-entry pixie pass (temp 0, stored scores) + heuristic warnings + manual.pdf |
 | `src/pdf.rs` | minimal local PDF writer: dump + structured manual |
 | `src/tui.rs` | crossterm prompt box (no ratatui) |
 | `src/store.rs` | cache dir + slug |
