@@ -32,7 +32,7 @@ use crate::llm::{llm_app, llm_endpoint};
 
 const VALID_KINDS: &[&str] = &["spec", "fault", "review", "dimensions", "facts", "howto", "reference", "history", "other"];
 
-async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, chapters: &[String], meaning: &str, query: &str, marks: &[String], base: &str, title: &str, text: &str) -> (String, Vec<String>, Vec<[String; 2]>, Vec<String>, String, String, i64) {
+async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, chapters: &[String], meaning: &str, query: &str, marks: &[String], base: &str, title: &str, text: &str, fail_log: &mut Vec<serde_json::Value>) -> (String, Vec<String>, Vec<[String; 2]>, Vec<String>, String, String, i64) {
     let excerpt: String = text.chars().take(5000).collect();
     let chlist = chapters.join(" | ");
     let marks_line = if marks.is_empty() {
@@ -90,11 +90,19 @@ async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, ch
     let (v, tooled) = match attempt {
         Some((v, tooled)) => (v, tooled),
         None => {
+            // both tries failed (timeout, eviction, down slot): on the
+            // record, with identity — silent fallbacks filled a manual once
+            fail_log.push(serde_json::json!({"title": title, "url": base, "kind": "no-response"}));
             let sec = chapters.last().cloned().unwrap_or_else(|| "Other".into());
             let (k, b, s, q, sec, via) = with_via(heuristic(title, &excerpt), vec![], sec, "heuristic:no-llm");
             return (k, b, s, q, sec, via, -1);
         }
     };
+    // failure telemetry for the unparseable path below: finish reason
+    // ("length" = max_tokens cut) and token counts travel with the raw head
+    let finish: String = v["choices"][0].get("finish_reason").and_then(|f| f.as_str()).unwrap_or("").into();
+    let comp_tokens: u64 = v["usage"].get("completion_tokens").and_then(|n| n.as_u64()).unwrap_or(0);
+    let raw_head: String = v["choices"][0]["message"].get("content").and_then(|c| c.as_str()).unwrap_or("").chars().take(2000).collect();
     let parsed: Option<(String, Vec<String>, Vec<[String; 2]>, Vec<String>, String, bool, i64)> = (|| {
         // v resolved by llm::chat_json (tool contract → envelope → content)
         let raw_kind = v.get("kind").and_then(|k| k.as_str()).unwrap_or("other").to_lowercase();
@@ -168,6 +176,13 @@ async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, ch
             (k, b, s, q, sec, via, r)
         }
         None => {
+            // answered but unusable: persist the raw head + finish reason
+            // so parse failures stop being invisible (truncation? prose
+            // preamble? dialect drift? — evidence first, then the fix)
+            fail_log.push(serde_json::json!({
+                "title": title, "url": base, "kind": "unparseable",
+                "finish": finish, "completion_tokens": comp_tokens, "raw": raw_head,
+            }));
             let (k, b, s) = heuristic(title, &excerpt);
             (k, b, s, vec![], chapters.last().cloned().unwrap_or_else(|| "Other".into()), "heuristic:parse".into(), -1)
         }
@@ -176,6 +191,27 @@ async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, ch
 
 fn with_via(h: (String, Vec<String>, Vec<[String; 2]>), quotes: Vec<String>, section: String, via: &str) -> (String, Vec<String>, Vec<[String; 2]>, Vec<String>, String, String) {
     (h.0, h.1, h.2, quotes, section, via.into())
+}
+
+/// Split unscored fallback entries from scored ones, preserving original
+/// indices for the keeper_at remap. Heuristic entries survive ONLY when
+/// nothing scored (labeled draft beats nothing); otherwise they shadow
+/// (caller files them to drops.json with cause). Pure — unit-tested below,
+/// used by the run loop above (no theater: same function, both places).
+fn partition_shadowed(indexed: Vec<(usize, Entry)>) -> (Vec<(usize, Entry)>, Vec<(usize, Entry)>) {
+    if !indexed.iter().any(|(_, e)| e.via.starts_with("llm")) {
+        return (indexed, vec![]);
+    }
+    let mut kept = vec![];
+    let mut shadowed = vec![];
+    for (oi, e) in indexed {
+        if e.via.starts_with("heuristic") {
+            shadowed.push((oi, e));
+        } else {
+            kept.push((oi, e));
+        }
+    }
+    (kept, shadowed)
 }
 
 fn heuristic(title: &str, text: &str) -> (String, Vec<String>, Vec<[String; 2]>) {
@@ -361,6 +397,9 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
     let mut corrobor: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     // index map: seek.json page position -> entries position (keepers only)
     let mut keeper_at: Vec<Option<usize>> = vec![None; arr.len()];
+    // raw failed model outputs (truncations, preambles, dialect drift):
+    // parse failures stop being invisible
+    let mut fail_log: Vec<serde_json::Value> = vec![];
     let kept_total = keeper_idx.len();
     for (n, i) in keeper_idx.iter().copied().enumerate() {
         let p = &arr[i];
@@ -378,7 +417,7 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
         if let Some(tx) = &prog {
             let _ = tx.send(format!("pixie {}/{} {}", n + 1, kept_total, url.chars().take(50).collect::<String>()));
         }
-        let (kind, bullets, specs, quotes, section, via, relevance) = process_one(&client, &endpoint, &via_tag, &chapters, &meaning, &query, &marks, &url, &title, &text).await;
+        let (kind, bullets, specs, quotes, section, via, relevance) = process_one(&client, &endpoint, &via_tag, &chapters, &meaning, &query, &marks, &url, &title, &text, &mut fail_log).await;
         // namesake filter: parenthetical disambiguators that never belong
         // in a subject manual (bands, surnames, albums share query words;
         // poetry movements named for obscurity — the Mixolydian class —
@@ -413,6 +452,42 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
             continue;
         }
         entries.push(Entry { url, title, kind, via, bullets, specs, quotes, section, claimed_by: 0, relevance });
+    }
+    // shadow-drop: heuristic fallback entries are excluded whenever ANY
+    // LLM-scored entry exists — unscored bullets must not file as manual
+    // facts (a 14-strong shadow cohort once read as fabricated Key figures
+    // under the judge's lamp). They survive only when nothing scored
+    // (a labeled draft beats nothing), and land in drops.json with cause
+    // either way. Runs BEFORE dup attribution so indices stay honest.
+    {
+        let indexed: Vec<(usize, Entry)> = entries.drain(..).enumerate().collect();
+        let (kept_pairs, shadow_pairs) = partition_shadowed(indexed);
+        // remap is entries-index space: rebuild from kept pairs
+        let mut remap: Vec<Option<usize>> = vec![];
+        let mut kept: Vec<Entry> = Vec::with_capacity(kept_pairs.len());
+        for (oi, e) in kept_pairs {
+            if remap.len() <= oi {
+                remap.resize(oi + 1, None);
+            }
+            remap[oi] = Some(kept.len());
+            kept.push(e);
+        }
+        for (_, e) in shadow_pairs {
+            if let Some(tx) = &prog {
+                let _ = tx.send(format!("drop shadowed ({}): {}", e.relevance, e.title.chars().take(50).collect::<String>()));
+            }
+            drops.push(serde_json::json!({
+                "title": e.title, "url": e.url,
+                "reason": "unscored-shadowed",
+                "via": e.via, "relevance": e.relevance,
+                "bullets": e.bullets,
+            }));
+            dropped_irrelevant += 1;
+        }
+        entries = kept;
+        for slot in keeper_at.iter_mut() {
+            *slot = slot.and_then(|oi| remap.get(oi).copied().flatten());
+        }
     }
     // second pass: attribute dups to their keepers (entries index space)
     for p in arr.iter() {
@@ -531,9 +606,11 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
         h
     };
     crate::pdf::render_manual(&query, &chapters, &intros, &mentries, &hosts, &dir.join("manual.pdf"))?;
-    // drops file + manifest stage: the manual's provenance chain gains
-    // its process link (entries kept, chunks refused with scores)
+    // drops file + failures file + manifest stage: the manual's provenance
+    // chain gains its process link (entries kept, chunks refused with
+    // scores, raw model failures on record)
     let _ = std::fs::write(&dir.join("drops.json"), serde_json::to_string_pretty(&drops).unwrap_or_default());
+    let _ = std::fs::write(&dir.join("llm-failures.jsonl"), fail_log.iter().map(|v| serde_json::to_string(v).unwrap_or_default() + "\n").collect::<String>());
     crate::db::manifest_stage(
         &dir,
         "process",
@@ -541,6 +618,7 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
             "processed.json": crate::db::sha_file(&dir.join("processed.json")),
             "manual.pdf": crate::db::sha_file(&dir.join("manual.pdf")),
             "drops.json": crate::db::sha_file(&dir.join("drops.json")),
+            "llm-failures.jsonl": crate::db::sha_file(&dir.join("llm-failures.jsonl")),
             "entries": entries.len(),
             "dropped": dropped_irrelevant,
         }),
@@ -549,4 +627,42 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
         let _ = tx.send("done".into());
     }
     Ok(dir)
+}
+
+#[cfg(test)]
+mod shadow_tests {
+    use super::{partition_shadowed, Entry};
+
+    fn entry(via: &str) -> Entry {
+        Entry {
+            url: "https://x.example".into(),
+            title: "T".into(),
+            kind: "facts".into(),
+            via: via.into(),
+            bullets: vec![],
+            specs: vec![],
+            quotes: vec![],
+            section: "Facts".into(),
+            claimed_by: 0,
+            relevance: if via.starts_with("llm") { 90 } else { -1 },
+        }
+    }
+
+    #[test]
+    fn shadows_only_beside_scored() {
+        let idx: Vec<(usize, Entry)> = vec![(0, entry("llm:test:json")), (1, entry("heuristic:parse")), (2, entry("heuristic:no-llm"))];
+        let (kept, shadow) = partition_shadowed(idx);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(shadow.len(), 2);
+        assert_eq!(kept[0].0, 0, "original index preserved for remap");
+        assert_eq!(shadow[0].0, 1);
+    }
+
+    #[test]
+    fn all_heuristic_survives_labeled() {
+        let idx: Vec<(usize, Entry)> = vec![(0, entry("heuristic:parse")), (1, entry("heuristic:no-llm"))];
+        let (kept, shadow) = partition_shadowed(idx);
+        assert_eq!(kept.len(), 2, "draft beats nothing");
+        assert!(shadow.is_empty());
+    }
 }
