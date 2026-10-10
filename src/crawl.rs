@@ -32,6 +32,57 @@ fn client() -> reqwest::Client {
         .clone()
 }
 
+/// Stopwords that are capitalized only by position (sentence-initial)
+/// or are pronunciation guides, never names. Shared by the lexicon and
+/// the distinguishing marks.
+const NAME_STOP: &[&str] = &[
+    "from", "with", "and", "the", "for", "that", "this", "are", "was", "were", "have", "has",
+    "which", "their", "been", "also", "into", "such", "than", "then", "them", "when", "where",
+    "what", "there", "these", "those", "will", "would", "about", "after", "before", "between",
+];
+
+/// Proper nouns: capitalized words longer than 3 chars, minus stopwords
+/// and short all-caps abbreviations ("IPA" is a guide, not a person).
+fn proper_nouns(s: &str) -> Vec<String> {
+    let mut out = vec![];
+    for tok in s.split(|c: char| !c.is_ascii_alphanumeric()).filter(|t| t.len() > 3) {
+        if !tok.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+            continue;
+        }
+        if tok.chars().all(|c| c.is_ascii_uppercase()) {
+            continue;
+        }
+        if NAME_STOP.contains(&tok.to_lowercase().as_str()) {
+            continue;
+        }
+        out.push(tok.to_lowercase());
+    }
+    out
+}
+
+/// Distinguishing marks: the tokens that tell same-words-different-subject
+/// apart. Digit-bearing whitespace tokens with dots kept ("1.3" stays one
+/// token, not "1"+"3") plus proper nouns from query, subject and meaning.
+/// The scorer prompt names these explicitly: a page matching the words
+/// with different marks (another year, another engine, another person)
+/// is a different subject. ("opel corsa 2005 1.3 cdti" → 2005, 1.3;
+/// hermeticism → hermes, trismegistus via the card.)
+pub fn discriminators(query: &str, card: &QueryCard) -> Vec<String> {
+    let mut set: std::collections::HashSet<String> = Default::default();
+    for tok in query.split_whitespace() {
+        let t = tok.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        if t.len() > 1 && t.chars().any(|c| c.is_ascii_digit()) {
+            set.insert(t.to_lowercase());
+        }
+    }
+    for n in proper_nouns(query).into_iter().chain(proper_nouns(&card.subject)).chain(proper_nouns(&card.meaning)) {
+        set.insert(n);
+    }
+    let mut out: Vec<String> = set.into_iter().collect();
+    out.sort();
+    out
+}
+
 /// Subject lexicon: query + card subject + aliases, stemmed. Every book
 /// and chunk gate works from THESE tokens — never from chapter-augmented
 /// search strings ("hermeticism History" must not let a book through on
@@ -65,27 +116,10 @@ pub fn subject_lexicon(query: &str, card: &QueryCard) -> Vec<String> {
         feed(a);
     }
     // proper nouns from the meaning line (central figures): intake matching
-    // must know Hermes Trismegistus belongs to Hermeticism. Only
-    // capitalized words longer than 3 chars, minus sentence-initial
-    // stopwords ("From hermetic +…" would otherwise admit every book on
-    // the word "from") and short all-caps abbreviations ("IPA" from the
-    // pronunciation guide is not a person).
-    const STOP: &[&str] = &[
-        "from", "with", "and", "the", "for", "that", "this", "are", "was", "were", "have", "has",
-        "which", "their", "been", "also", "into", "such", "than", "then", "them", "when", "where",
-        "what", "there", "these", "those", "will", "would", "about", "after", "before", "between",
-    ];
-    for tok in card.meaning.split(|c: char| !c.is_ascii_alphanumeric()).filter(|t| t.len() > 3) {
-        if !tok.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
-            continue;
-        }
-        if tok.chars().all(|c| c.is_ascii_uppercase()) {
-            continue;
-        }
-        if STOP.contains(&tok.to_lowercase().as_str()) {
-            continue;
-        }
-        set.insert(tok.to_lowercase());
+    // must know Hermes Trismegistus belongs to Hermeticism (shared helper:
+    // same hygiene as the distinguishing marks).
+    for n in proper_nouns(&card.meaning) {
+        set.insert(n);
     }
     let mut out: Vec<String> = set.into_iter().collect();
     out.sort();
@@ -2420,5 +2454,32 @@ mod ledger_tests {
         assert_eq!(a.ms_med, 100);
         let b = s.iter().find(|f| f.host == "b.example").unwrap();
         assert_eq!((b.ok, b.fail, b.other), (0, 0, 1));
+    }
+}
+
+#[cfg(test)]
+mod marks_tests {
+    use super::{discriminators, QueryCard};
+
+    fn card(subject: &str, meaning: &str) -> QueryCard {
+        QueryCard { subject: subject.into(), meaning: meaning.into(), aliases: vec![], instance: String::new() }
+    }
+
+    #[test]
+    fn digits_survive_with_dots() {
+        let m = discriminators("opel corsa 2005 1.3 cdti", &card("opel corsa 2005 1.3 cdti", "supermini car"));
+        assert!(m.iter().any(|t| t == "2005"), "year kept: {m:?}");
+        assert!(m.iter().any(|t| t == "1.3"), "dotted engine kept whole: {m:?}");
+        assert!(!m.iter().any(|t| t == "1" || t == "3"), "no digit shards: {m:?}");
+    }
+
+    #[test]
+    fn figures_come_from_the_card() {
+        let m = discriminators(
+            "hermeticism",
+            &card("Hermeticism", "philosophical tradition based on writings attributed to Hermes Trismegistus"),
+        );
+        assert!(m.iter().any(|t| t == "hermes"), "figure kept: {m:?}");
+        assert!(m.iter().any(|t| t == "trismegistus"), "figure kept: {m:?}");
     }
 }

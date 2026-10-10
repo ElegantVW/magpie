@@ -33,74 +33,119 @@ fn norm_words(t: &str) -> HashSet<String> {
         .collect()
 }
 
-/// Split texts over 12000 chars into ~6000-char paragraph windows.
-/// First chunk keeps the URL; rest get #chunk-N fragments (canon keeps
-/// fragments, so chunks survive dedupe as distinct entries).
+/// Content-defined chunking (FastCDC gear hash over bytes): cut points
+/// derive from CONTENT, so identical text chunks identically across
+/// re-crawls — seams survive, dedupe gets honest, the loop's floods stay
+/// comparable. Cuts snap to paragraph breaks (verbatim quotes stay
+/// readable); OCR walls fall back to whitespace, then raw char boundaries.
+/// Same contract as the old window chunker: first chunk keeps the URL,
+/// rest get #chunk-N fragments.
 fn chunk_pages(pages: &mut Vec<Page>) {
-    const LIMIT: usize = 12_000;
-    const WINDOW: usize = 6_000;
+    const LIMIT: usize = 12_000; // chars; below this, untouched
+    const MIN_B: usize = 2048;
+    const AVG_B: usize = 6144;
+    const MAX_B: usize = 12_288;
     let mut out: Vec<Page> = Vec::with_capacity(pages.len());
     for p in pages.drain(..) {
         if p.chars <= LIMIT {
             out.push(p);
             continue;
         }
-        // paragraph boundaries: blank-line runs, else single newlines
-        let paras: Vec<&str> = p.text.split("\n\n").collect();
-        let mut cur = String::new();
-        let mut cur_n = 0usize;
-        let mut n = 0usize;
-        let mut flush = |cur: &mut String, cur_n: &mut usize, n: &mut usize, out: &mut Vec<Page>, p: &Page| {
-            if cur.trim().is_empty() {
-                return;
-            }
-            let url = if *n == 0 { p.url.clone() } else { format!("{}#chunk-{n}", p.url) };
-            let title = if *n == 0 {
-                p.title.clone()
-            } else {
-                format!("{} (part {})", p.title, *n + 1)
-            };
-            let text = std::mem::take(cur);
-            let chars = text.chars().count();
-            out.push(Page { url, title, text, chars, dup_of: None });
-            *cur_n = 0;
-            *n += 1;
-        };
-        for para in paras {
-            // hard-split pathological single paragraphs (OCR walls)
-            if para.chars().count() > WINDOW {
-                flush(&mut cur, &mut cur_n, &mut n, &mut out, &p);
-                let mut w = String::new();
-                let mut wn = 0usize;
-                for word in para.split_whitespace() {
-                    let l = word.chars().count() + 1;
-                    if wn + l > WINDOW && !w.is_empty() {
-                        flush(&mut w, &mut wn, &mut n, &mut out, &p);
-                    }
-                    if !w.is_empty() {
-                        w.push(' ');
-                        wn += 1;
-                    }
-                    w.push_str(word);
-                    wn += word.chars().count();
+        let bytes = p.text.as_bytes();
+        let cuts: Vec<usize> = {
+            let mut v = vec![0usize];
+            for c in fastcdc::v2020::FastCDC::new(bytes, MIN_B, AVG_B, MAX_B) {
+                let end = c.offset + c.length;
+                if end < bytes.len() {
+                    v.push(snap_cut(bytes, end));
                 }
-                cur = w;
-                cur_n = wn;
+            }
+            v.push(bytes.len());
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        if cuts.len() < 3 {
+            // single chunk (or degenerate): keep whole, no fragmentation
+            out.push(p);
+            continue;
+        }
+        for (n, w) in cuts.windows(2).enumerate() {
+            let (a, b) = (w[0], w[1]);
+            if a >= b {
                 continue;
             }
-            let l = para.chars().count() + 2;
-            if cur_n + l > WINDOW && !cur.trim().is_empty() {
-                flush(&mut cur, &mut cur_n, &mut n, &mut out, &p);
+            let text = p.text[a..b].to_string();
+            if text.trim().is_empty() {
+                continue;
             }
-            if !cur.is_empty() {
-                cur.push_str("\n\n");
-            }
-            cur.push_str(para);
-            cur_n += l;
+            let url = if n == 0 { p.url.clone() } else { format!("{}#chunk-{n}", p.url) };
+            let title = if n == 0 {
+                p.title.clone()
+            } else {
+                format!("{} (part {})", p.title, n + 1)
+            };
+            let chars = text.chars().count();
+            out.push(Page { url, title, text, chars, dup_of: None });
         }
-        flush(&mut cur, &mut cur_n, &mut n, &mut out, &p);
     }
     *pages = out;
+}
+
+/// Snap a byte cut to a paragraph break nearby (backward first, then
+/// forward), else whitespace, else the nearest char boundary. \n is ASCII
+/// so byte search never splits a codepoint; the final adjust guarantees it.
+fn snap_cut(bytes: &[u8], mut cut: usize) -> usize {
+    cut = cut.min(bytes.len());
+    // backward \n\n within 1500B
+    let from = cut.saturating_sub(1500);
+    if let Some(pos) = bytes[from..cut].windows(2).rposition(|w| w == b"\n\n") {
+        return adjust_boundary(bytes, from + pos + 2);
+    }
+    // forward \n\n within 1500B
+    let to = (cut + 1500).min(bytes.len());
+    if cut < to {
+        if let Some(pos) = bytes[cut..to].windows(2).position(|w| w == b"\n\n") {
+            return adjust_boundary(bytes, cut + pos + 2);
+        }
+    }
+    // whitespace within 200B either way
+    let wfrom = cut.saturating_sub(200);
+    let wto = (cut + 200).min(bytes.len());
+    let mut best: Option<usize> = None;
+    let mut best_d = usize::MAX;
+    for (i, b) in bytes[wfrom..wto].iter().enumerate() {
+        if b.is_ascii_whitespace() {
+            let d = (wfrom + i).abs_diff(cut);
+            if d < best_d {
+                best_d = d;
+                best = Some(wfrom + i + 1);
+            }
+        }
+    }
+    adjust_boundary(bytes, best.unwrap_or(cut))
+}
+
+fn adjust_boundary(bytes: &[u8], mut i: usize) -> usize {
+    i = i.min(bytes.len());
+    while i < bytes.len() && !is_boundary(bytes, i) {
+        i += 1;
+    }
+    if i > bytes.len() {
+        i = bytes.len();
+    }
+    while i > 0 && !is_boundary(bytes, i) {
+        i -= 1;
+    }
+    i
+}
+
+fn is_boundary(bytes: &[u8], i: usize) -> bool {
+    if i >= bytes.len() {
+        return true;
+    }
+    // UTF-8 continuation bytes are 10xxxxxx
+    bytes[i] & 0xC0 != 0x80
 }
 
 /// Near-duplicate pass: flag pages whose normalized word overlap ≥80%
@@ -384,4 +429,65 @@ pub async fn run_seek_with_progress(
         let _ = tx.send("done".into());
     }
     Ok(dir)
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    use super::{chunk_pages, Page};
+
+    fn page(url: &str, text: String) -> Page {
+        let chars = text.chars().count();
+        Page { url: url.into(), title: "T".into(), text, chars, dup_of: None }
+    }
+
+    fn big_text() -> String {
+        // 30KB of paragraph-structured prose with a hard seam phrase
+        let mut s = String::new();
+        for i in 0..100 {
+            s.push_str(&format!("Paragraph {i} about Hermes Trismegistus and the Corpus Hermeticum, with alchemy and philosophy woven through dense esoteric prose meant to fill out chunk windows.\n\n"));
+        }
+        s
+    }
+
+    #[test]
+    fn seams_are_deterministic() {
+        let mut a = vec![page("https://x.example/book", big_text())];
+        let mut b = vec![page("https://x.example/book", big_text())];
+        chunk_pages(&mut a);
+        chunk_pages(&mut b);
+        assert!(a.len() > 1, "long text must fragment");
+        let ta: Vec<&str> = a.iter().map(|p| p.text.as_str()).collect();
+        let tb: Vec<&str> = b.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(ta, tb, "same bytes → same seams across re-crawls");
+    }
+
+    #[test]
+    fn chunks_are_verbatim_substrings() {
+        let src = big_text();
+        let mut v = vec![page("https://x.example/book", src.clone())];
+        chunk_pages(&mut v);
+        for c in &v {
+            assert!(src.contains(&c.text), "chunk must occur verbatim (quotes depend on it): {:?}", &c.text[..60.min(c.text.len())]);
+        }
+        // first keeps the URL, rest fragment
+        assert_eq!(v[0].url, "https://x.example/book");
+        assert!(v[1].url.starts_with("https://x.example/book#chunk-"));
+    }
+
+    #[test]
+    fn short_text_untouched_and_ocr_wall_survives() {
+        let mut v = vec![page("https://x.example/s", "small text".into())];
+        chunk_pages(&mut v);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].text, "small text");
+        // 20KB single paragraph (OCR wall): must fragment without panic,
+        // every piece a valid substring
+        let wall = "lorem ipsum dolor sit amet ".repeat(900);
+        let mut w = vec![page("https://x.example/wall", wall.clone())];
+        chunk_pages(&mut w);
+        assert!(w.len() > 1, "wall must fragment");
+        for c in &w {
+            assert!(wall.contains(&c.text));
+        }
+    }
 }

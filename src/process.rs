@@ -32,10 +32,15 @@ use crate::llm::{llm_app, llm_endpoint};
 
 const VALID_KINDS: &[&str] = &["spec", "fault", "review", "dimensions", "facts", "howto", "reference", "history", "other"];
 
-async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, chapters: &[String], meaning: &str, query: &str, base: &str, title: &str, text: &str) -> (String, Vec<String>, Vec<[String; 2]>, Vec<String>, String, String, i64) {
+async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, chapters: &[String], meaning: &str, query: &str, marks: &[String], base: &str, title: &str, text: &str) -> (String, Vec<String>, Vec<[String; 2]>, Vec<String>, String, String, i64) {
     let excerpt: String = text.chars().take(5000).collect();
     let chlist = chapters.join(" | ");
-    let sys = format!("You file web pages into a knowledge manual on '{query}' ({meaning}). Reply with ONLY a single JSON object, no other text. Quotes must be copied EXACTLY from the text, at most 90 characters each. Relevance scores whether the page is ABOUT the subject itself — never the chapter, never derivation: something NAMED AFTER or DERIVED FROM the subject (a poetry movement named for obscurity, a band called Portugal, a surname) scores below 40 even when the chapter seems to fit. A page that never names the subject, or names it once in passing while really being about something else (a political theory book mentioning the subject in one paragraph), scores below 40. File each page into exactly one chapter: {chlist}.");
+    let marks_line = if marks.is_empty() {
+        String::new()
+    } else {
+        format!(" Distinguishing marks of THIS subject: {}. A page about the same words with different marks (another year, another engine, another person) is a different subject: below 40.", marks.join(", "))
+    };
+    let sys = format!("You file web pages into a knowledge manual on '{query}' ({meaning}). Reply with ONLY a single JSON object, no other text. Quotes must be copied EXACTLY from the text, at most 90 characters each. Relevance scores whether the page is ABOUT the subject itself — never the chapter, never derivation: something NAMED AFTER or DERIVED FROM the subject (a poetry movement named for obscurity, a band called Portugal, a surname) scores below 40 even when the chapter seems to fit. A page that never names the subject, or names it once in passing while really being about something else (a political theory book mentioning the subject in one paragraph), scores below 40.{marks_line} File each page into exactly one chapter: {chlist}.");
     let user = format!(
         "{{\"task\": \"classify\", \"title\": \"{title}\", \"url\": \"{base}\", \"text\": \"{excerpt}\", \"want\": {{\"kind\": \"spec|fault|review|dimensions|facts|howto|reference|history|other\", \"relevance\": \"0-100 fit to the subject\", \"section\": \"one of: {chlist}\", \"bullets\": [\"up to 10 facts\"], \"specs\": [[\"key\", \"value\"] up to 12], \"quotes\": [\"up to 3 verbatim spans\"]}}}}"
     );
@@ -247,13 +252,12 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
         .chars()
         .take(300)
         .collect();
-    // subject lexicon from the stored card (query + subject + aliases +
-    // meaning proper nouns, all stemmed). Currently informational: per-chunk
-    // lexical gating was measured harmful (see keeper loop note) and stays
-    // out. Kept for the log line so card drift is visible per run.
-    let card_lex: Vec<String> = (|| {
+    // subject card rebuilt from storage: lexicon (informational, see note
+    // below) and distinguishing marks (fed to the scorer prompt — a page
+    // matching the words with different marks is a different subject).
+    let card = (|| {
         let qc = v.get("query_card")?;
-        let card = crate::crawl::QueryCard {
+        Some(crate::crawl::QueryCard {
             subject: qc.get("subject").and_then(|s| s.as_str()).unwrap_or("").into(),
             meaning: qc.get("meaning").and_then(|s| s.as_str()).unwrap_or("").into(),
             aliases: qc
@@ -262,17 +266,23 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
                 .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
                 .unwrap_or_default(),
             instance: String::new(),
-        };
-        Some(crate::crawl::subject_lexicon(&query, &card))
+        })
     })()
-    .unwrap_or_else(|| {
-        query
-            .to_lowercase()
-            .split(|c: char| !c.is_ascii_alphanumeric())
-            .filter(|t| t.len() > 2)
-            .map(|t| t.to_string())
-            .collect()
+    .unwrap_or_else(|| crate::crawl::QueryCard {
+        subject: query.clone(),
+        meaning: query.clone(),
+        aliases: vec![],
+        instance: String::new(),
     });
+    // subject lexicon from the stored card (query + subject + aliases +
+    // meaning proper nouns, all stemmed). Currently informational: per-chunk
+    // lexical gating was measured harmful (see keeper loop note) and stays
+    // out. Kept for the log line so card drift is visible per run.
+    let card_lex: Vec<String> = crate::crawl::subject_lexicon(&query, &card);
+    // distinguishing marks feed the scorer (probe-verified: Dugin 65→20,
+    // OPC →30, both mains kept; poetry-namesake still needs the
+    // parenthetical filter below, not the model).
+    let marks: Vec<String> = crate::crawl::discriminators(&query, &card);
     // route inference through menagerie (house control plane): ensure the
     // magpie slot, resolve its URL. No raw-port assumptions.
     let app = llm_app();
@@ -285,7 +295,7 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
     }
     let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().map_err(|e| MagpieError::Network(e.to_string()))?;
     if let Some(tx) = &prog {
-        let _ = tx.send(format!("subject lexicon ({} tokens)", card_lex.len()));
+        let _ = tx.send(format!("subject lexicon ({} tokens), marks: {}", card_lex.len(), marks.join(", ")));
     }
     let mut entries = vec![];
     // volume guard: cap keepers so hundred-chunk book pulls stay tractable.
@@ -365,9 +375,12 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
         if let Some(tx) = &prog {
             let _ = tx.send(format!("pixie {}/{} {}", n + 1, kept_total, url.chars().take(50).collect::<String>()));
         }
-        let (kind, bullets, specs, quotes, section, via, relevance) = process_one(&client, &endpoint, &via_tag, &chapters, &meaning, &query, &url, &title, &text).await;
+        let (kind, bullets, specs, quotes, section, via, relevance) = process_one(&client, &endpoint, &via_tag, &chapters, &meaning, &query, &marks, &url, &title, &text).await;
         // namesake filter: parenthetical disambiguators that never belong
-        // in a subject manual (bands, surnames, albums share query words)
+        // in a subject manual (bands, surnames, albums share query words;
+        // poetry movements named for obscurity — the Mixolydian class —
+        // probe-measured at 45, above the model's gate, so this stays
+        // deterministic)
         let tl = title.to_lowercase();
         if tl.contains("(band)")
             || tl.contains("(surname)")
@@ -376,6 +389,7 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
             || tl.contains("(album)")
             || tl.contains("(song)")
             || tl.contains("(mode)")
+            || tl.contains("(poetry)")
         {
             if let Some(tx) = &prog {
                 let _ = tx.send(format!("drop namesake: {}", title.chars().take(50).collect::<String>()));
