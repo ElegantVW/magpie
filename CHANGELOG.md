@@ -1,6 +1,6 @@
 # Changelog — magpie
 
-## Unreleased — producer arc (seek → manual → judge → rinse → loop food)
+## Unreleased — producer arc (release name: `nest-egg`, cut on the first APPROVED manual)
 - Producer passes: LLM query expansion pre-crawl, 30-language Wikidata fan-out, post-crawl judge (text verdicts; APPROVED appends appendix, REDO costs no render).
 - Relevance that bites: subject-anchored scoring, distinguishing marks (years/engines/names), namesake filter, unscored-defaults-drop, per-entry scores stored.
 - Programs database: append-only JSONL amber + subject partitions + quarantine with reasons + SHA manifests (`manifest.json` merges seek → process → judge).
