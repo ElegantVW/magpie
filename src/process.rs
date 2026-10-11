@@ -447,6 +447,11 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
             || tl.contains("(song)")
             || tl.contains("(mode)")
             || tl.contains("(poetry)")
+            // discussion noise: forum thread links and bot-persona posts
+            // (a Lemmy "Frankenstein" thread once filed as a margarita entry)
+            || tl.contains("thread")
+            || tl.contains("comment on")
+            || tl.contains("show hn")
         {
             if let Some(tx) = &prog {
                 let _ = tx.send(format!("drop namesake: {}", title.chars().take(50).collect::<String>()));

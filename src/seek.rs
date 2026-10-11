@@ -215,7 +215,7 @@ pub async fn run_seek_with_progress(
     if let Some(tx) = &prog {
         let _ = tx.send(format!("crawling {} urls…", plan.urls.len()));
     }
-    let (mut pages, mut frecs) = crawl_urls(&plan.urls, prog.clone()).await;
+    let (mut pages, mut frecs) = crawl_urls(&plan.urls, prog.clone(), &plan.title_hints).await;
     // bulk legs already fetched content (WARC, structured APIs): merge in
     let n_pre = plan.prefetched.len();
     // raw reserve: bulk legs never pass through crawl_urls' archive, so
@@ -242,7 +242,7 @@ pub async fn run_seek_with_progress(
             if let Some(tx) = &prog {
                 let _ = tx.send(format!("crawling {} extra urls…", extra.len()));
             }
-            let (mut more, mut more_recs) = crawl_urls(&extra, prog.clone()).await;
+            let (mut more, mut more_recs) = crawl_urls(&extra, prog.clone(), &Default::default()).await;
             frecs.append(&mut more_recs);
             pages.append(&mut more);
         }

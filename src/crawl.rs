@@ -332,7 +332,7 @@ async fn fetch_one(url: &str) -> Result<Page> {
 /// A doc URL answering HTML (viewer page, login wall) falls back to the
 /// page path — the server lied, not the link. Same ledger discipline as
 /// fetch_measured; outcome vocabulary gains "oversize".
-async fn fetch_doc_measured(url: &str, kind: crate::docs::DocKind) -> (Result<Page>, FetchRecord) {
+async fn fetch_doc_measured(url: &str, kind: crate::docs::DocKind, hint: &str) -> (Result<Page>, FetchRecord) {
     let host = host_of(url);
     let t0 = std::time::Instant::now();
     let c = client();
@@ -427,7 +427,7 @@ async fn fetch_doc_measured(url: &str, kind: crate::docs::DocKind) -> (Result<Pa
         match crate::docs::extract(kind, &bytes) {
             Ok(text) => {
                 let chars = text.chars().count();
-                let title = crate::docs::title_for(url, kind);
+                let title = crate::docs::title_for_hint(url, kind, hint);
                 let rec = FetchRecord {
                     url: url.to_string(),
                     host,
@@ -1084,7 +1084,7 @@ async fn ia_books(search_q: &str, subject_q: &str, card: &QueryCard, prog: &Opti
             } else {
                 crate::docs::DocKind::Pdf
             };
-            match fetch_doc_measured(&file_url, kind).await {
+            match fetch_doc_measured(&file_url, kind, &title).await {
                 (Ok(p), _) => {
                     // retitle to the WORK (file stems are noise)
                     p.text
@@ -1403,7 +1403,7 @@ async fn openalex_pages(query: &str) -> Vec<Page> {
 /// no XML dep for one feed). Returns (pages, pdf_urls): PDF links flow
 /// into the doc pipeline (extensionless arxiv URLs need the non-html
 /// reroute in crawl_urls). One request per run (arXiv asks 3s spacing).
-async fn arxiv_pages(query: &str) -> (Vec<Page>, Vec<String>) {
+async fn arxiv_pages(query: &str) -> (Vec<Page>, Vec<(String, String)>) {
     let c = client();
     let url = format!(
         "https://export.arxiv.org/api/query?search_query=all:{}&max_results=5&sortBy=relevance&sortOrder=descending",
@@ -1451,7 +1451,7 @@ async fn arxiv_pages(query: &str) -> (Vec<Page>, Vec<String>) {
             continue;
         }
         if !arxiv_id.is_empty() {
-            pdfs.push(format!("https://arxiv.org/pdf/{arxiv_id}"));
+            pdfs.push((format!("https://arxiv.org/pdf/{arxiv_id}"), title.clone()));
         }
         pages.push(Page {
             url: format!("https://arxiv.org/abs/{arxiv_id}"),
@@ -2350,6 +2350,10 @@ pub struct CrawlPlan {
     /// refused works with reasons (quarantine, not deletion)
     #[serde(default)]
     pub quarantine: Vec<Quarantine>,
+    /// URL → display-title hints for fetched documents (arXiv paper titles;
+    /// bare numeric stems name nothing)
+    #[serde(default)]
+    pub title_hints: std::collections::HashMap<String, String>,
 }
 
 /// Build thorough URL list: DDG + Marginalia + Wikipedia titles.
@@ -2664,6 +2668,7 @@ pub async fn plan_urls(
     // StackExchange, Lemmy), structured (DBpedia top-up inside translations
     // below). Synthetic Pages for substantive API content; discussion URLs
     // join the normal fetch pipeline (thin content dies at gates, not here).
+    let mut arxiv_hints: std::collections::HashMap<String, String> = Default::default();
     {
         let mark = prefetched.len();
         let t0 = std::time::Instant::now();
@@ -2687,10 +2692,11 @@ pub async fn plan_urls(
             prefetched.push(p);
             an += 1;
         }
-        for u in apdfs {
+        for (u, hint) in apdfs {
             if urls.len() >= max_pages + 8 || !seen.insert(canon_url(&u)) {
                 continue;
             }
+            arxiv_hints.insert(u.clone(), hint);
             urls.push(u);
         }
         ledger_source("arxiv", query, an, t0.elapsed().as_millis() as u64);
@@ -2720,7 +2726,6 @@ pub async fn plan_urls(
         }
         ledger_source("stackexchange", query, sn, t0.elapsed().as_millis() as u64);
         legs.push(("stackexchange".into(), sn));
-        let t0 = std::time::Instant::now();
         send("search: lemmy…");
         let (lpage, lurls) = lemmy_discussion(query, &prog).await;
         let mut ln = 0usize;
@@ -2737,7 +2742,8 @@ pub async fn plan_urls(
             urls.push(u);
             ln += 1;
         }
-        ledger_source("lemmy", query, ln, t0.elapsed().as_millis() as u64);
+        // (per-instance rows above are the ledger truth; no summary row —
+        // a double ledger once counted lemmy twice per call)
         legs.push(("lemmy".into(), ln));
     }
     // entity traversal: top wikidata entities seed their articles
@@ -2945,7 +2951,7 @@ pub async fn plan_urls(
         true
     });
     urls.truncate(max_pages + 8);
-    CrawlPlan { urls, prefetched, legs, query_card: card, expansion: expansion_queries, translations: trans_flat, quarantine: plan_quarantine }
+    CrawlPlan { urls, prefetched, legs, query_card: card, expansion: expansion_queries, translations: trans_flat, quarantine: plan_quarantine, title_hints: arxiv_hints }
 }
 
 /// robots.txt, cached per host: best-effort Disallow check.
@@ -2996,18 +3002,20 @@ async fn robots_allows(url: &str) -> bool {
     ok
 }
 
-pub async fn crawl_urls(urls: &[String], prog: Option<tokio::sync::mpsc::UnboundedSender<String>>) -> (Vec<Page>, Vec<FetchRecord>) {
+pub async fn crawl_urls(urls: &[String], prog: Option<tokio::sync::mpsc::UnboundedSender<String>>, title_hints: &std::collections::HashMap<String, String>) -> (Vec<Page>, Vec<FetchRecord>) {
     use std::sync::Arc;
     use tokio::sync::Semaphore;
     // 3 concurrent fetches, 250ms launch pacing: fast but polite.
     // (Was serial 400ms; time no longer matters more than coverage,
     // but citizenship still does.)
     let total = urls.len();
+    let hints = std::sync::Arc::new(title_hints.clone());
     let sem = Arc::new(Semaphore::new(3));
     let mut handles = vec![];
     for (i, u) in urls.iter().cloned().enumerate() {
         let prog = prog.clone();
         let sem = sem.clone();
+        let hints = hints.clone();
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire_owned().await;
             if let Some(tx) = &prog {
@@ -3040,7 +3048,7 @@ pub async fn crawl_urls(urls: &[String], prog: Option<tokio::sync::mpsc::Unbound
             // tokens the same way; density judgment stays with the LLM
             // relevance pass downstream, exactly like web pages).
             if let Some(kind) = crate::docs::classify_url(&u) {
-                match fetch_doc_measured(&u, kind).await {
+                match fetch_doc_measured(&u, kind, hints.get(&u).map(|s| s.as_str()).unwrap_or("")).await {
                     (Ok(p), rec) => {
                         if p.text.chars().count() < 200 {
                             if let Some(tx) = &prog {
@@ -3100,7 +3108,7 @@ pub async fn crawl_urls(urls: &[String], prog: Option<tokio::sync::mpsc::Unbound
                     // classify_ctype decides; images and unknowns stay failed.
                     if rec.outcome == "non-html" {
                         if let Some(kind) = crate::docs::classify_ctype(&rec.note) {
-                            match fetch_doc_measured(&u, kind).await {
+                            match fetch_doc_measured(&u, kind, hints.get(&u).map(|s| s.as_str()).unwrap_or("")).await {
                                 (Ok(p), rec) => {
                                     if p.text.chars().count() < 200 {
                                         let mut rec = rec;
@@ -3508,7 +3516,7 @@ mod pool_tests {
             row("seznam", 4, 0.2, now_s),
         ];
         let s = engine_stats(&lines, now_h);
-        let (rate_d, fails_d, age_d) = s["ddg"];
+        let (_, fails_d, age_d) = s["ddg"];
         assert_eq!(fails_d, 3);
         assert!(engine_sidelined(fails_d, age_d));
         let (rate_s, fails_s, _) = s["seznam"];

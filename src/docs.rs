@@ -90,7 +90,13 @@ pub fn kind_suffix(kind: DocKind) -> &'static str {
 }
 
 /// Title from URL file stem (".../corsa-c-datasheet.pdf" → "corsa-c-datasheet (PDF)").
+/// Bare-numeric stems (arXiv "2110", "2405") fall back to the hint when
+/// given — a paper ID is not a title (the "2110 (PDF)" manual entry was).
 pub fn title_for(url: &str, kind: DocKind) -> String {
+    title_for_hint(url, kind, "")
+}
+
+pub fn title_for_hint(url: &str, kind: DocKind, hint: &str) -> String {
     let base = url.split(['?', '#']).next().unwrap_or(url);
     let stem = base
         .rsplit('/')
@@ -99,6 +105,10 @@ pub fn title_for(url: &str, kind: DocKind) -> String {
         .rsplit_once('.')
         .map(|(s, _)| s)
         .unwrap_or("document");
+    // numeric-only stems name nothing: prefer the caller's real title
+    if !hint.is_empty() && stem.chars().all(|c| c.is_ascii_digit() || c == '.' || c == 'v') {
+        return format!("{} ({})", hint.chars().take(80).collect::<String>(), kind_suffix(kind));
+    }
     let clean: String = stem
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
