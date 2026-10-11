@@ -83,6 +83,21 @@ pub fn discriminators(query: &str, card: &QueryCard) -> Vec<String> {
     out
 }
 
+/// Shared stemmer (suffix-strip): "hermeticism" → "hermet", matching
+/// "hermetic"/"hermeticism"/"hermeticum" as substrings (short lex token
+/// inside longer text words — the right direction). One copy, used by the
+/// lexicon and the title gate alike.
+fn stem_token(t: &str) -> String {
+    let mut s = t.to_string();
+    for suf in ["icism", "ism", "ists", "ist", "tion", "ing", "ed", "es", "s"] {
+        if s.len() > suf.len() + 3 && s.ends_with(suf) {
+            s.truncate(s.len() - suf.len());
+            break;
+        }
+    }
+    s
+}
+
 /// Subject lexicon: query + card subject + aliases, stemmed. Every book
 /// and chunk gate works from THESE tokens — never from chapter-augmented
 /// search strings ("hermeticism History" must not let a book through on
@@ -90,21 +105,11 @@ pub fn discriminators(query: &str, card: &QueryCard) -> Vec<String> {
 /// volume matched "history" in front matter and rode the History chapter
 /// into 24 keeper slots.
 pub fn subject_lexicon(query: &str, card: &QueryCard) -> Vec<String> {
-    let stem = |t: &str| -> String {
-        let mut s = t.to_string();
-        for suf in ["icism", "ism", "ists", "ist", "tion", "ing", "ed", "es", "s"] {
-            if s.len() > suf.len() + 3 && s.ends_with(suf) {
-                s.truncate(s.len() - suf.len());
-                break;
-            }
-        }
-        s
-    };
     let mut set: std::collections::HashSet<String> = Default::default();
     let mut feed = |s: &str| {
         for tok in s.to_lowercase().split(|c: char| !c.is_ascii_alphanumeric()).filter(|t| t.len() > 2) {
             set.insert(tok.to_string());
-            let st = stem(tok);
+            let st = stem_token(tok);
             if st.len() > 2 {
                 set.insert(st);
             }
@@ -1296,6 +1301,429 @@ async fn openlibrary(query: &str) -> Vec<Page> {
     }]
 }
 
+/// Tier 2 source legs (all keyless, all verified live from this box):
+/// scholarly (OpenAlex, arXiv), experience (HN, StackExchange, Lemmy),
+/// structured (DBpedia). Scholarly/structured legs yield synthetic Pages
+/// (API content is substantive); experience legs yield discussion URLs for
+/// the normal fetch+score pipeline (question pages, not snippets — thin
+/// content must die at the gates, not in the leg). Every outcome ledgered
+/// to db/sources (yields per source, ms per call).
+
+/// Title carries a query token (len>3), raw or stemmed — "hermeticism"
+/// must match "Hermetic Tradition" (a test caught the raw-only gap).
+/// The scholarly title gate: OpenAlex returns 100K+ passing mentions;
+/// only titled works qualify (same philosophy as the book title gate).
+fn title_matches(query: &str, title: &str) -> bool {
+    let lt = title.to_lowercase();
+    query
+        .to_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| t.len() > 3)
+        .any(|t| lt.contains(t) || lt.contains(&stem_token(t)[..]))
+}
+
+/// OpenAlex scholarly works: abstract + authors + venue + year + DOI.
+/// Anonymous lane (no key, no mailto); identified UA per their etiquette.
+async fn openalex_pages(query: &str) -> Vec<Page> {
+    let c = client();
+    let url = format!(
+        "https://api.openalex.org/works?search={}&per-page=6",
+        url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>()
+    );
+    let txt = match c
+        .get(&url)
+        .header(reqwest::header::USER_AGENT, "magpie-research/0.1 (https://github.com/ElegantVW/magpie)")
+        .send()
+        .await
+    {
+        Ok(r) => r.text().await.unwrap_or_default(),
+        Err(_) => return vec![],
+    };
+    let v: serde_json::Value = serde_json::from_str(&txt).unwrap_or(serde_json::Value::Null);
+    let results = v.get("results").and_then(|r| r.as_array()).cloned().unwrap_or_default();
+    let mut out = vec![];
+    for w in results {
+        let title = w.get("display_name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        if title.is_empty() || !title_matches(query, &title) {
+            continue;
+        }
+        // abstract_inverted_index: word -> positions; rebuild by position
+        let mut words: Vec<(usize, String)> = vec![];
+        if let Some(idx) = w.get("abstract_inverted_index").and_then(|x| x.as_object()) {
+            for (word, pos) in idx {
+                if let Some(arr) = pos.as_array() {
+                    for p in arr.iter().filter_map(|x| x.as_u64()) {
+                        words.push((p as usize, word.clone()));
+                    }
+                }
+            }
+        }
+        words.sort_by_key(|(p, _)| *p);
+        let abs: String = words.iter().map(|(_, word)| word.clone()).collect::<Vec<_>>().join(" ").chars().take(3000).collect();
+        let authors: String = w
+            .get("authorships")
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.get("author").and_then(|au| au.get("display_name")).and_then(|n| n.as_str()))
+                    .take(6)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        let year = w.get("publication_year").map(|y| y.to_string()).unwrap_or_else(|| "?".into());
+        let venue = w
+            .get("primary_location")
+            .and_then(|l| l.get("source"))
+            .and_then(|s| s.get("display_name"))
+            .and_then(|n| n.as_str())
+            .unwrap_or("?");
+        let doi = w.get("doi").and_then(|x| x.as_str()).unwrap_or("");
+        let cited = w.get("cited_by_count").map(|x| x.to_string()).unwrap_or_else(|| "?".into());
+        let text = format!("{title}\n{authors} ({year}). {venue}. Cited by {cited}.\n{doi}\n\n{abs}");
+        let chars = text.chars().count();
+        if chars < 300 {
+            continue;
+        }
+        out.push(Page {
+            url: format!("https://openalex.org/works/{}", w.get("id").and_then(|x| x.as_str()).unwrap_or("").rsplit('/').next().unwrap_or("")),
+            title: format!("{title} — OpenAlex"),
+            text,
+            chars,
+            dup_of: None,
+        });
+        if out.len() >= 3 {
+            break;
+        }
+    }
+    out
+}
+
+/// arXiv preprints: title-gated like OpenAlex (feed XML parsed by regex —
+/// no XML dep for one feed). Returns (pages, pdf_urls): PDF links flow
+/// into the doc pipeline (extensionless arxiv URLs need the non-html
+/// reroute in crawl_urls). One request per run (arXiv asks 3s spacing).
+async fn arxiv_pages(query: &str) -> (Vec<Page>, Vec<String>) {
+    let c = client();
+    let url = format!(
+        "https://export.arxiv.org/api/query?search_query=all:{}&max_results=5&sortBy=relevance&sortOrder=descending",
+        url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>()
+    );
+    let txt = match c
+        .get(&url)
+        .header(reqwest::header::USER_AGENT, "magpie-research/0.1 (https://github.com/ElegantVW/magpie)")
+        .send()
+        .await
+    {
+        Ok(r) => r.text().await.unwrap_or_default(),
+        Err(_) => return (vec![], vec![]),
+    };
+    let re_entry = Regex::new(r"(?s)<entry>(.*?)</entry>").unwrap();
+    let field = |block: &str, tag: &str| -> String {
+        Regex::new(&format!(r"(?s)<{tag}[^>]*>(.*?)</{tag}>", tag = tag))
+            .ok()
+            .and_then(|re| re.captures(block).map(|c| c[1].to_string()))
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let mut pages = vec![];
+    let mut pdfs = vec![];
+    for cap in re_entry.captures_iter(&txt) {
+        let b = &cap[1];
+        let title = field(b, "title");
+        if title.is_empty() || !title_matches(query, &title) {
+            continue;
+        }
+        let summary: String = field(b, "summary").chars().take(2500).collect();
+        let id = field(b, "id");
+        let arxiv_id = id.rsplit('/').next().unwrap_or("").to_string();
+        let authors: Vec<String> = Regex::new(r"<name>(.*?)</name>")
+            .unwrap()
+            .captures_iter(b)
+            .map(|c| c[1].to_string())
+            .take(5)
+            .collect();
+        let text = format!("{title}\n{}.\n{}\n\n{summary}", authors.join(", "), arxiv_id);
+        let chars = text.chars().count();
+        if chars < 300 {
+            continue;
+        }
+        if !arxiv_id.is_empty() {
+            pdfs.push(format!("https://arxiv.org/pdf/{arxiv_id}"));
+        }
+        pages.push(Page {
+            url: format!("https://arxiv.org/abs/{arxiv_id}"),
+            title: format!("{title} — arXiv"),
+            text,
+            chars,
+            dup_of: None,
+        });
+        if pages.len() >= 3 {
+            break;
+        }
+    }
+    (pages, pdfs)
+}
+
+/// HN Algolia: story links only (comments are thin here; discussion
+/// quality lives on Lemmy/SE). URLs join the normal fetch pipeline.
+async fn hn_urls(query: &str) -> Vec<String> {
+    let c = client();
+    let url = format!(
+        "https://hn.algolia.com/api/v1/search?query={}&tags=story&hitsPerPage=5",
+        url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>()
+    );
+    let txt = match c.get(&url).send().await {
+        Ok(r) => r.text().await.unwrap_or_default(),
+        Err(_) => return vec![],
+    };
+    let v: serde_json::Value = serde_json::from_str(&txt).unwrap_or(serde_json::Value::Null);
+    v.get("hits")
+        .and_then(|h| h.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|h| h.get("url").and_then(|u| u.as_str()).map(|s| s.to_string()))
+                .filter(|u| u.starts_with("http"))
+                .take(4)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// StackExchange sites per domain (intitle search, relevance sort).
+/// Question LINKS join the pipeline (full pages score normally; snippets
+/// would die thin at the gates — same rule as HN).
+fn se_sites(query: &str, domain: &str) -> Vec<&'static str> {
+    let lq = query.to_lowercase();
+    if lq.contains("cocktail") || lq.contains("mixolog") || lq.contains("drink") || lq.contains("recipe") || lq.contains("food") || lq.contains("cook") {
+        return vec!["cooking", "alcohol"];
+    }
+    match domain {
+        "vehicle" => vec!["mechanics"],
+        "place" => vec!["travel"],
+        "field" => vec!["philosophy", "history"],
+        _ => vec!["superuser"],
+    }
+}
+
+async fn se_urls(query: &str, domain: &str) -> Vec<String> {
+    let c = client();
+    let mut out = vec![];
+    for site in se_sites(query, domain) {
+        let url = format!(
+            "https://api.stackexchange.com/2.3/search?order=desc&sort=relevance&intitle={}&site={}&pagesize=3",
+            url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>(),
+            site
+        );
+        let txt = match c.get(&url).send().await {
+            Ok(r) => r.text().await.unwrap_or_default(),
+            Err(_) => continue,
+        };
+        let v: serde_json::Value = serde_json::from_str(&txt).unwrap_or(serde_json::Value::Null);
+        if let Some(items) = v.get("items").and_then(|i| i.as_array()) {
+            for it in items.iter().take(2) {
+                if let Some(link) = it.get("link").and_then(|l| l.as_str()) {
+                    out.push(link.to_string());
+                }
+            }
+        }
+        if out.len() >= 4 {
+            break;
+        }
+    }
+    out
+}
+
+/// Lemmy discussion, instance-rotated (.world and sopuli are dead from
+/// this box; rotation is the lesson). First instance with results wins;
+/// every tried instance ledgered (failures are data). Top comments become
+/// ONE attributed digest page (lived experience, voiced as such — the
+/// attribution prompt line makes opinionated sources safe); post links
+/// join the normal pipeline.
+const LEMMY_INSTANCES: &[&str] = &["https://lemmy.ml", "https://lemmy.world", "https://sopuli.xyz", "https://lemmy.dbzer0.com"];
+
+async fn lemmy_discussion(query: &str, prog: &Option<tokio::sync::mpsc::UnboundedSender<String>>) -> (Option<Page>, Vec<String>) {
+    let send = |m: &str| {
+        if let Some(tx) = prog {
+            let _ = tx.send(m.to_string());
+        }
+    };
+    let c = client();
+    for inst in LEMMY_INSTANCES {
+        let t0 = std::time::Instant::now();
+        let url = format!(
+            "{inst}/api/v3/search?q={}&type_=All&limit=4",
+            url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>()
+        );
+        let txt = match tokio::time::timeout(std::time::Duration::from_secs(15), c.get(&url).send()).await {
+            Ok(Ok(r)) => r.text().await.unwrap_or_default(),
+            _ => {
+                crate::db::append("sources", serde_json::json!({"source": format!("lemmy:{inst}"), "query": query, "n": 0, "ms": t0.elapsed().as_millis() as u64}));
+                continue;
+            }
+        };
+        let v: serde_json::Value = serde_json::from_str(&txt).unwrap_or(serde_json::Value::Null);
+        let mut lines = vec![format!("Lemmy discussion on “{query}” (voices, not verdicts):")];
+        let mut urls = vec![];
+        if let Some(posts) = v.get("posts").and_then(|p| p.as_array()) {
+            for p in posts.iter().take(3) {
+                let name = p.get("post").and_then(|x| x.get("name")).and_then(|x| x.as_str()).unwrap_or("");
+                let ap = p.get("post").and_then(|x| x.get("ap_id")).and_then(|x| x.as_str()).unwrap_or("");
+                let who = p.get("creator").and_then(|x| x.get("name")).and_then(|x| x.as_str()).unwrap_or("?");
+                if name.is_empty() {
+                    continue;
+                }
+                lines.push(format!("- u/{who}: {name}"));
+                if !ap.is_empty() && urls.len() < 4 {
+                    urls.push(ap.to_string());
+                }
+            }
+        }
+        if let Some(comments) = v.get("comments").and_then(|x| x.as_array()) {
+            for cm in comments.iter().take(4) {
+                let body: String = cm
+                    .get("comment")
+                    .and_then(|x| x.get("content"))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .chars()
+                    .take(500)
+                    .collect();
+                let who = cm.get("creator").and_then(|x| x.get("name")).and_then(|x| x.as_str()).unwrap_or("?");
+                if body.chars().count() > 60 {
+                    lines.push(format!("- u/{who} writes: {body}"));
+                }
+            }
+        }
+        let n = urls.len() + lines.len().saturating_sub(1);
+        crate::db::append("sources", serde_json::json!({"source": format!("lemmy:{inst}"), "query": query, "n": n, "ms": t0.elapsed().as_millis() as u64}));
+        if n == 0 {
+            continue;
+        }
+        send(&format!("search: lemmy ({inst}) got {n}"));
+        let text = lines.join("\n");
+        let chars = text.chars().count();
+        let page = if chars >= 200 {
+            Some(Page { url: format!("{inst}/search?q={query}"), title: format!("Lemmy voices: {query}"), text, chars, dup_of: None })
+        } else {
+            None
+        };
+        return (page, urls);
+    }
+    (None, vec![])
+}
+
+/// DBpedia structured top-up: enwiki title → resource JSON → labels in
+/// languages Wikidata missed + abstract page. Deterministic, no scraping.
+async fn dbpedia_topup(query: &str, have_langs: &std::collections::HashSet<String>) -> (Vec<(String, String, Vec<String>)>, Option<Page>) {
+    let c = client();
+    // enwiki title for the query (limit 1)
+    let s = match c
+        .get(&format!(
+            "https://en.wikipedia.org/w/api.php?action=opensearch&search={}&limit=1&format=json",
+            url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>()
+        ))
+        .send()
+        .await
+    {
+        Ok(r) => r.text().await.unwrap_or_default(),
+        Err(_) => return (vec![], None),
+    };
+    let v: serde_json::Value = serde_json::from_str(&s).unwrap_or(serde_json::Value::Null);
+    let title = v
+        .as_array()
+        .and_then(|a| a.get(1))
+        .and_then(|x| x.as_array())
+        .and_then(|a| a.first())
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    if title.is_empty() {
+        return (vec![], None);
+    }
+    let resource = title.replace(' ', "_");
+    let t = match c
+        .get(&format!(
+            "https://dbpedia.org/data/{}.json",
+            url::form_urlencoded::byte_serialize(resource.as_bytes()).collect::<String>()
+        ))
+        .send()
+        .await
+    {
+        Ok(r) => r.text().await.unwrap_or_default(),
+        Err(_) => return (vec![], None),
+    };
+    let v: serde_json::Value = serde_json::from_str(&t).unwrap_or(serde_json::Value::Null);
+    let mut out = vec![];
+    let mut abstract_en = String::new();
+    if let Some(obj) = v.as_object().and_then(|m| m.values().next()).and_then(|e| e.as_object()) {
+        if let Some(labels) = obj.get("http://www.w3.org/2000/01/rdf-schema#label").and_then(|l| l.as_array()) {
+            for l in labels {
+                let lang = l.get("lang").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                let val = l.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                if lang.is_empty() || lang == "en" || val.is_empty() || have_langs.contains(&lang) {
+                    continue;
+                }
+                // per-language opensearch like the Wikidata leg (limit 2)
+                let u = format!(
+                    "https://{lang}.wikipedia.org/w/api.php?action=opensearch&search={}&limit=2&format=json",
+                    url::form_urlencoded::byte_serialize(val.as_bytes()).collect::<String>()
+                );
+                let r = match c.get(&u).send().await {
+                    Ok(r) => r.text().await.unwrap_or_default(),
+                    Err(_) => continue,
+                };
+                let rv: serde_json::Value = serde_json::from_str(&r).unwrap_or(serde_json::Value::Null);
+                let mut urls = vec![];
+                if let Some(arr) = rv.as_array() {
+                    if let Some(links) = arr.get(3).and_then(|x| x.as_array()) {
+                        for link in links.iter().take(2) {
+                            if let Some(s) = link.as_str() {
+                                urls.push(s.to_string());
+                            }
+                        }
+                    }
+                }
+                if !urls.is_empty() {
+                    out.push((lang, val, urls));
+                }
+                if out.len() >= 6 {
+                    break;
+                }
+            }
+        }
+        if let Some(abs) = obj.get("http://dbpedia.org/ontology/abstract").and_then(|l| l.as_array()) {
+            for a in abs {
+                if a.get("lang").and_then(|x| x.as_str()) == Some("en") {
+                    abstract_en = a.get("value").and_then(|x| x.as_str()).unwrap_or("").chars().take(3000).collect();
+                    break;
+                }
+            }
+        }
+    }
+    let page = if abstract_en.chars().count() >= 300 {
+        let chars = abstract_en.chars().count();
+        Some(Page {
+            url: format!("https://dbpedia.org/page/{resource}"),
+            title: format!("{title} — DBpedia"),
+            text: abstract_en,
+            chars,
+            dup_of: None,
+        })
+    } else {
+        None
+    };
+    (out, page)
+}
+
+/// One ledger row per source-leg call (yields + ms). The engines table
+/// stays engines-only; sources are not interchangeable providers.
+fn ledger_source(leg: &str, query: &str, n: usize, ms: u64) {
+    crate::db::append("sources", serde_json::json!({"source": leg, "query": query, "n": n, "ms": ms}));
+}
+
 /// Wikidata entity traversal: top entities for the query contribute their
 /// article sitelinks as seed URLs (finds "Cocktail" from "mixology").
 async fn wiki_related(query: &str) -> Vec<String> {
@@ -2232,6 +2660,86 @@ pub async fn plan_urls(
         legs.push(("books-refused".into(), refused.len()));
         plan_quarantine = refused;
     }
+    // Tier 2 source legs: scholarly (OpenAlex, arXiv), experience (HN,
+    // StackExchange, Lemmy), structured (DBpedia top-up inside translations
+    // below). Synthetic Pages for substantive API content; discussion URLs
+    // join the normal fetch pipeline (thin content dies at gates, not here).
+    {
+        let mark = prefetched.len();
+        let t0 = std::time::Instant::now();
+        send("search: openalex…");
+        for p in openalex_pages(query).await {
+            if spam_url(&p.url) || !seen.insert(canon_url(&p.url)) {
+                continue;
+            }
+            prefetched.push(p);
+        }
+        ledger_source("openalex", query, prefetched.len() - mark, t0.elapsed().as_millis() as u64);
+        legs.push(("openalex".into(), prefetched.len() - mark));
+        let t0 = std::time::Instant::now();
+        send("search: arxiv…");
+        let (apages, apdfs) = arxiv_pages(query).await;
+        let mut an = 0usize;
+        for p in apages {
+            if spam_url(&p.url) || !seen.insert(canon_url(&p.url)) {
+                continue;
+            }
+            prefetched.push(p);
+            an += 1;
+        }
+        for u in apdfs {
+            if urls.len() >= max_pages + 8 || !seen.insert(canon_url(&u)) {
+                continue;
+            }
+            urls.push(u);
+        }
+        ledger_source("arxiv", query, an, t0.elapsed().as_millis() as u64);
+        legs.push(("arxiv".into(), an));
+        let t0 = std::time::Instant::now();
+        send("search: hn…");
+        let mut hn = 0usize;
+        for u in hn_urls(query).await {
+            if urls.len() >= max_pages + 8 || spam_url(&u) || !seen.insert(canon_url(&u)) {
+                continue;
+            }
+            urls.push(u);
+            hn += 1;
+        }
+        ledger_source("hn", query, hn, t0.elapsed().as_millis() as u64);
+        legs.push(("hn".into(), hn));
+        let t0 = std::time::Instant::now();
+        send("search: stackexchange…");
+        let domain_se = subject_domain(query, &card.instance);
+        let mut sn = 0usize;
+        for u in se_urls(query, &domain_se).await {
+            if urls.len() >= max_pages + 8 || spam_url(&u) || !seen.insert(canon_url(&u)) {
+                continue;
+            }
+            urls.push(u);
+            sn += 1;
+        }
+        ledger_source("stackexchange", query, sn, t0.elapsed().as_millis() as u64);
+        legs.push(("stackexchange".into(), sn));
+        let t0 = std::time::Instant::now();
+        send("search: lemmy…");
+        let (lpage, lurls) = lemmy_discussion(query, &prog).await;
+        let mut ln = 0usize;
+        if let Some(p) = lpage {
+            if !spam_url(&p.url) && seen.insert(canon_url(&p.url)) {
+                prefetched.push(p);
+                ln += 1;
+            }
+        }
+        for u in lurls {
+            if urls.len() >= max_pages + 8 || spam_url(&u) || !seen.insert(canon_url(&u)) {
+                continue;
+            }
+            urls.push(u);
+            ln += 1;
+        }
+        ledger_source("lemmy", query, ln, t0.elapsed().as_millis() as u64);
+        legs.push(("lemmy".into(), ln));
+    }
     // entity traversal: top wikidata entities seed their articles
     // ("mixology" -> Cocktail, Bartender, List of cocktails…)
     if urls.len() < max_pages + 4 {
@@ -2268,6 +2776,41 @@ pub async fn plan_urls(
             if urls.len() >= max_pages + 8 {
                 break;
             }
+        }
+        // DBpedia top-up: structured labels for languages Wikidata missed
+        // (deterministic, no scraping) + abstract page. Fills gaps, never
+        // duplicates: have_langs skips what's already covered.
+        if urls.len() < max_pages + 8 {
+            let t0 = std::time::Instant::now();
+            send("search: dbpedia…");
+            let have: std::collections::HashSet<String> =
+                trans_flat.iter().map(|(l, _, _)| l.clone()).collect();
+            let (extra, abstract_page) = dbpedia_topup(query, &have).await;
+            let mut dn = 0usize;
+            for (lang, label, turls) in extra {
+                for u in turls {
+                    if spam_url(&u) || !seen.insert(canon_url(&u)) {
+                        continue;
+                    }
+                    trans_flat.push((lang.clone(), label.clone(), u.clone()));
+                    urls.push(u.clone());
+                    dn += 1;
+                    if urls.len() >= max_pages + 8 {
+                        break;
+                    }
+                }
+                if urls.len() >= max_pages + 8 {
+                    break;
+                }
+            }
+            if let Some(p) = abstract_page {
+                if !spam_url(&p.url) && seen.insert(canon_url(&p.url)) {
+                    prefetched.push(p);
+                    dn += 1;
+                }
+            }
+            ledger_source("dbpedia", query, dn, t0.elapsed().as_millis() as u64);
+            legs.push(("dbpedia".into(), dn));
         }
         legs.push(("translations".into(), trans_flat.len()));
         crate::db::append(
@@ -2551,6 +3094,37 @@ pub async fn crawl_urls(urls: &[String], prog: Option<tokio::sync::mpsc::Unbound
                     (Some((i, p)), Some(rec))
                 }
                 (Err(_), rec) => {
+                    // extensionless documents (arxiv /pdf/ links carry no
+                    // suffix): the non-html note names the content-type —
+                    // reroute into the doc pipeline instead of failing.
+                    // classify_ctype decides; images and unknowns stay failed.
+                    if rec.outcome == "non-html" {
+                        if let Some(kind) = crate::docs::classify_ctype(&rec.note) {
+                            match fetch_doc_measured(&u, kind).await {
+                                (Ok(p), rec) => {
+                                    if p.text.chars().count() < 200 {
+                                        let mut rec = rec;
+                                        rec.outcome = "thin".into();
+                                        crate::db::append("fetch", serde_json::to_value(&rec).unwrap_or_default());
+                                        return (None, Some(rec));
+                                    }
+                                    crate::db::append(
+                                        "crawl",
+                                        serde_json::json!({"url": p.url, "title": p.title, "chars": p.chars, "text": p.text}),
+                                    );
+                                    crate::db::append("fetch", serde_json::to_value(&rec).unwrap_or_default());
+                                    if let Some(tx) = &prog {
+                                        let _ = tx.send(format!("got {}/{} {}c doc", i + 1, total, p.chars));
+                                    }
+                                    return (Some((i, p)), Some(rec));
+                                }
+                                (Err(_), rec) => {
+                                    crate::db::append("fetch", serde_json::to_value(&rec).unwrap_or_default());
+                                    return (None, Some(rec));
+                                }
+                            }
+                        }
+                    }
                     crate::db::append("fetch", serde_json::to_value(&rec).unwrap_or_default());
                     if let Some(tx) = &prog {
                         let _ = tx.send(format!("fail {}/{} ({} {})", i + 1, total, rec.status.map(|s| s.to_string()).unwrap_or_else(|| "net".into()), rec.note.chars().take(30).collect::<String>()));
@@ -2975,5 +3549,27 @@ mod pool_tests {
         let lines = vec!["not json".to_string(), row("ddg", 0, 0.1, now)];
         let s = engine_stats(&lines, now);
         assert_eq!(s["ddg"].1, 1);
+    }
+}
+
+#[cfg(test)]
+mod tier2_tests {
+    use super::{se_sites, title_matches};
+
+    #[test]
+    fn title_gate_admits_titled_rejects_mention() {
+        assert!(title_matches("hermeticism", "Giordano Bruno and the Hermetic Tradition"));
+        assert!(title_matches("opel corsa 1.3 cdti", "Opel Corsa D 1.3 CDTI specs"));
+        assert!(!title_matches("hermeticism", "A General History of Magic volume 2"));
+        // short tokens never gate (avoid "of"/"the" matches)
+        assert!(!title_matches("it", "Anything At All"));
+    }
+
+    #[test]
+    fn se_sites_follow_domain_and_drink_words() {
+        assert_eq!(se_sites("opel corsa", "vehicle"), vec!["mechanics"]);
+        assert_eq!(se_sites("margarita cocktail", "field"), vec!["cooking", "alcohol"]);
+        assert_eq!(se_sites("lisbon", "place"), vec!["travel"]);
+        assert_eq!(se_sites("hermeticism", "field"), vec!["philosophy", "history"]);
     }
 }
