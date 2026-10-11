@@ -112,6 +112,28 @@ pub struct ChatOut {
     pub raw: String,
 }
 
+/// Server context window magpie is served with (menagerie registers every
+/// app at ctx=8192). Prompts are clamped to fit it — a request over the
+/// window comes back with an EMPTY completion, not an error, which is how
+/// 98 "Context size has been exceeded" events silently emptied chunks.
+const CTX_TOKENS: usize = 8192;
+/// ~3.6 chars/token for the Qwen3 family; deliberately pessimistic so the
+/// clamp errs toward a shorter prompt rather than a silent overflow.
+const CHARS_PER_TOKEN: usize = 3;
+
+/// Byte index `i` snapped down to a UTF-8 char boundary — slicing text at an
+/// arbitrary byte panics on multi-byte content (em-dashes, CJK, accented
+/// place names all appear in these chunks).
+fn floor_char_boundary(s: &str, mut i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 /// Convenience: system + user + enforced JSON object, parsed or None.
 pub async fn chat_json(
     client: &reqwest::Client,
@@ -121,6 +143,24 @@ pub async fn chat_json(
     max_tokens: u32,
     temperature: f32,
 ) -> Option<ChatOut> {
+    // clamp the user turn to fit: window - reply budget - system - slack.
+    // head+tail (never head-only: chapter headings and closing specs live
+    // at the end of a chunk and the model needs them).
+    let sys_tok = sys.len() / CHARS_PER_TOKEN + 16;
+    let room = CTX_TOKENS
+        .saturating_sub(max_tokens as usize + sys_tok + 64)
+        .max(256);
+    let budget = room * CHARS_PER_TOKEN;
+    let user: String = if user.len() <= budget {
+        user.to_string()
+    } else {
+        let head = budget * 3 / 5;
+        let tail = budget - head;
+        let cut = floor_char_boundary(user, head);
+        let tstart = floor_char_boundary(user, user.len() - tail);
+        format!("{}\n[...{:.0} chars elided: prompt fitted to the {}-token window...]\n{}", &user[..cut], (user.len() - tail - cut) as f64, CTX_TOKENS, &user[tstart..])
+    };
+    let user = user.as_str();
     let body = serde_json::json!({
         "messages": [{"role": "system", "content": sys}, {"role": "user", "content": user}],
         "temperature": temperature,
@@ -328,5 +368,29 @@ mod extract_tests {
         let both = r#"{"kind": "facts", "relevance": 80, "want": {"kind": "other"}}"#;
         let out2 = extract_json(&envelope(both)).expect("must parse");
         assert_eq!(out2.0.get("kind").and_then(|k| k.as_str()), Some("facts"));
+    }
+}
+
+#[cfg(test)]
+mod ctx_tests {
+    use super::{floor_char_boundary, CHARS_PER_TOKEN, CTX_TOKENS};
+
+    #[test]
+    fn boundary_snaps_to_char_start() {
+        let s = "aé€b"; // 1+2+3+1 bytes
+        for i in 0..=s.len() {
+            assert!(s.is_char_boundary(floor_char_boundary(s, i)), "byte {i}");
+        }
+        assert_eq!(floor_char_boundary("abc", 99), 3);
+    }
+
+    #[test]
+    fn budget_leaves_room_for_the_reply() {
+        // worst case: system at 4096 chars, reply 1024 tokens
+        let sys_tok = 4096 / CHARS_PER_TOKEN + 16;
+        let room = CTX_TOKENS.saturating_sub(1024 + sys_tok + 64);
+        let total_tok = sys_tok + room + 1024;
+        assert!(total_tok < CTX_TOKENS, "{total_tok} must fit {CTX_TOKENS}");
+        assert!(room >= 256, "floor keeps a usable prompt");
     }
 }
