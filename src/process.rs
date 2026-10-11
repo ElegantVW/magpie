@@ -181,6 +181,23 @@ fn with_via(h: (String, Vec<String>, Vec<[String; 2]>), quotes: Vec<String>, sec
 /// nothing scored (labeled draft beats nothing); otherwise they shadow
 /// (caller files them to drops.json with cause). Pure — unit-tested below,
 /// used by the run loop above (no theater: same function, both places).
+/// Surname namesake: "Teresa Lisbon" for query "lisbon". Strips magpie's
+/// site suffix (" - Wikipedia"), then requires EXACTLY two words where the
+/// second equals the whole (single-word) query. Multiword queries can never
+/// be a surname, so they return false — "Black Hole Sun" stays (the band
+/// case, already covered by the "(song)"/"(band)" parentheticals on the
+/// canonical pages).
+fn surname_namesake(lower_title: &str, query: &str) -> bool {
+    let q = query.trim();
+    if q.is_empty() || q.contains(char::is_whitespace) || !q.chars().all(|c| c.is_alphanumeric()) {
+        return false;
+    }
+    let ql = q.to_lowercase();
+    let head = lower_title.rsplit_once(" - ").map(|(h, _)| h).unwrap_or(lower_title);
+    let words: Vec<&str> = head.split_whitespace().collect();
+    words.len() == 2 && words[1] == ql
+}
+
 fn partition_shadowed(indexed: Vec<(usize, Entry)>) -> (Vec<(usize, Entry)>, Vec<(usize, Entry)>) {
     if !indexed.iter().any(|(_, e)| e.via.starts_with("llm")) {
         return (indexed, vec![]);
@@ -452,6 +469,13 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
             || tl.contains("thread")
             || tl.contains("comment on")
             || tl.contains("show hn")
+            // untagged person page whose SURNAME is the subject: "Teresa
+            // Lisbon" for query "lisbon". Capitalised Firstname + query
+            // token, 2 words, no parenthetical — the site suffix magpie
+            // appends (" - Wikipedia") is stripped before this test. Not a
+            // blanket dash rule: "Lisbon - Wikipedia" itself must survive,
+            // and multiword subjects ("black hole") can't match a surname.
+            || surname_namesake(&tl, &query)
         {
             if let Some(tx) = &prog {
                 let _ = tx.send(format!("drop namesake: {}", title.chars().take(50).collect::<String>()));
@@ -655,6 +679,24 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
         let _ = tx.send("done".into());
     }
     Ok(dir)
+}
+
+#[cfg(test)]
+mod surname_tests {
+    use super::surname_namesake;
+
+    #[test]
+    fn catches_surname_only_never_the_subject_page() {
+        assert!(surname_namesake("teresa lisbon - wikipedia", "lisbon"));
+        assert!(!surname_namesake("lisbon - wikipedia", "lisbon"));
+        assert!(!surname_namesake("lisbon treaty - wikipedia", "lisbon"));
+        // multiword queries are never surnames
+        assert!(!surname_namesake("soundgarden - black hole sun - lemmy.world", "black hole"));
+        // subject appearing first, not last
+        assert!(!surname_namesake("lisbon travel guide", "lisbon"));
+        // three words: not a bare firstname+surname pair
+        assert!(!surname_namesake("mary teresa lisbon", "lisbon"));
+    }
 }
 
 #[cfg(test)]
