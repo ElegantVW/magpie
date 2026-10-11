@@ -564,6 +564,105 @@ async fn marginalia_search(query: &str, n: usize) -> Vec<String> {
     marginalia_tries(query, n, 3, 20).await
 }
 
+/// Seznam (Czech independent index): plain GET, direct result anchors,
+/// no wall from this box (verified live 2026-10-11: Czech car results,
+/// no captcha). Browser UA required — the house UA gets the bot stare.
+async fn seznam_search(query: &str, n: usize) -> Vec<String> {
+    let c = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0")
+        .timeout(std::time::Duration::from_secs(20))
+        .build();
+    let c = match c {
+        Ok(c) => c,
+        Err(_) => return vec![],
+    };
+    let url = format!(
+        "https://search.seznam.cz/?q={}",
+        url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>()
+    );
+    let html = match c.get(&url).send().await {
+        Ok(r) => r.text().await.unwrap_or_default(),
+        Err(_) => return vec![],
+    };
+    let re_a = Regex::new(r#"(?i)<a[^>]+href="(https?://[^"]+)"[^>]*>"#).unwrap();
+    let mut out = vec![];
+    let mut seen = std::collections::HashSet::new();
+    for cap in re_a.captures_iter(&html) {
+        let h = cap[1].to_string();
+        let l = h.to_lowercase();
+        // chrome, not results (nav, help, browser promos, thumbnails)
+        if l.contains("seznam.cz") || l.contains("o-seznam") {
+            continue;
+        }
+        if !seen.insert(h.clone()) {
+            continue;
+        }
+        out.push(h);
+        if out.len() >= n {
+            break;
+        }
+    }
+    out
+}
+
+/// Per-engine outcome history for the measured pool. Reads the tail of
+/// db/engines.jsonl (cheap: last 300 lines) → name -> (success_rate,
+/// consecutive_recent_fails, newest_row_hours_ago). Pure over lines:
+/// unit-tested. Rows carry _at timestamps (db::append stamps them).
+fn engine_stats(lines: &[String], now_h: f64) -> std::collections::HashMap<String, (f64, usize, f64)> {
+    // name -> (oks, consec_fails, total, newest_age_h)
+    let mut acc: std::collections::HashMap<String, (usize, usize, usize, f64)> = Default::default();
+    for line in lines.iter().rev().take(300) {
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let name = v.get("engine").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let ok = v.get("urls").and_then(|x| x.as_u64()).unwrap_or(0) > 0;
+        let age_h = v
+            .get("_at")
+            .and_then(|x| x.as_str())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|t| now_h - t.timestamp() as f64 / 3600.0)
+            .unwrap_or(999.0);
+        let e = acc.entry(name).or_insert((0, 0, 0, age_h));
+        if e.3 > age_h {
+            e.3 = age_h; // newest-first scan: first seen is freshest... keep min
+        }
+        if ok {
+            e.0 += 1;
+            e.1 = 0; // success resets the fail streak (newest-first scan)
+        } else if e.0 == 0 {
+            // only leading (most-recent) fails count as consecutive
+            e.1 += 1;
+        }
+        e.2 += 1;
+    }
+    acc.into_iter()
+        .map(|(k, (oks, fails, total, age))| {
+            let rate = if total == 0 { 0.0 } else { oks as f64 / total as f64 };
+            (k, (rate, fails, age))
+        })
+        .collect()
+}
+
+/// Last 300 lines of db/engines.jsonl (empty when the pool is young).
+fn engine_history() -> Vec<String> {
+    let path = crate::db::db_dir().join("engines.jsonl");
+    let txt = std::fs::read_to_string(path).unwrap_or_default();
+    txt.lines().rev().take(300).map(|s| s.to_string()).collect::<Vec<_>>().into_iter().rev().collect()
+}
+
+/// Sideline rule: ≥3 consecutive recent fails AND the latest attempt is
+/// fresh (<2h) → skip this run. Stale failures parole automatically
+/// (a sidelined engine that is never tried could never recover).
+fn engine_sidelined(fails: usize, newest_age_h: f64) -> bool {
+    fails >= 3 && newest_age_h < 2.0
+}
+
 async fn marginalia_tries(query: &str, n: usize, tries: usize, wait_s: u64) -> Vec<String> {
     for attempt in 0..tries.max(1) {
         if attempt > 0 {
@@ -1731,26 +1830,57 @@ pub async fn plan_urls(
         );
     }
 
-    send("search: duckduckgo…");
-    let ddg = match tokio::time::timeout(std::time::Duration::from_secs(20), ddg_search(query, per_engine)).await {
-        Ok(v) => v,
-        Err(_) => {
-            send("search: duckduckgo timed out (20s), continuing…");
-            vec![]
+    // measured engine pool: DDG + Marginalia + Seznam, ordered by recent
+    // success, sidelined on fresh fail streaks, every outcome ledgered.
+    // (15 engines probed live 2026-10-11 from this box; Seznam is the only
+    // survivor besides the throttled incumbents. Failures are data: the
+    // planner routes around throttles instead of hoping.)
+    let now_h = chrono::Utc::now().timestamp() as f64 / 3600.0;
+    let stats = engine_stats(&engine_history(), now_h);
+    let mut pool: Vec<(&str, f64)> = ["duckduckgo", "marginalia", "seznam"]
+        .iter()
+        .map(|e| (*e, stats.get(*e).map(|s| s.0).unwrap_or(0.5)))
+        .collect();
+    // unknown engines (no history) sort middle (0.5): tried, not trusted
+    pool.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut raw: Vec<String> = vec![];
+    for (name, _rate) in pool {
+        let (fails, age) = stats.get(name).map(|s| (s.1, s.2)).unwrap_or((0, 999.0));
+        if engine_sidelined(fails, age) {
+            send(&format!("search: {name} sidelined (3 straight fresh fails)"));
+            continue;
         }
-    };
-    send(&format!("search: duckduckgo got {}", ddg.len()));
-    send("search: marginalia…");
-    let mar = match tokio::time::timeout(std::time::Duration::from_secs(20), marginalia_search(query, per_engine)).await {
-        Ok(v) => v,
-        Err(_) => {
-            send("search: marginalia timed out (20s), continuing…");
-            vec![]
-        }
-    };
-    send(&format!("search: marginalia got {}", mar.len()));
+        send(&format!("search: {name}…"));
+        let t0 = std::time::Instant::now();
+        let found: Vec<String> = match tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            async {
+                match name {
+                    "duckduckgo" => ddg_search(query, per_engine).await,
+                    "marginalia" => marginalia_search(query, per_engine).await,
+                    _ => seznam_search(query, per_engine).await,
+                }
+            },
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(_) => {
+                send(&format!("search: {name} timed out (20s), continuing…"));
+                vec![]
+            }
+        };
+        let ms = t0.elapsed().as_millis() as u64;
+        send(&format!("search: {name} got {}", found.len()));
+        crate::db::append(
+            "engines",
+            serde_json::json!({"engine": name, "query": query, "urls": found.len(), "ms": ms}),
+        );
+        legs.push((format!("engines:{name}"), found.len()));
+        raw.extend(found);
+    }
 
-    let mut raw: Vec<String> = ddg.into_iter().chain(mar).collect();
+    // raw already holds the pooled engine hits above
     // relevance gate on the EXPANDED lexicon (wikipedia/verticals exempt)
     let gated: Vec<String> = raw.drain(..).filter(|u| !spam_url(u) && model_gate(&gate_q, u)).collect();
     legs.push(("engines".into(), gated.len()));
@@ -2540,5 +2670,75 @@ mod evidence_tests {
         assert!(!junk_evidence_url("https://github.com/ElegantVW/magpie"));
         assert!(!junk_evidence_url("https://archive.org/details/corpus-hermeticum-htp"));
         assert!(!junk_evidence_url("https://plato.stanford.edu/entries/hermetism/"));
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::{engine_sidelined, engine_stats};
+
+    fn row(engine: &str, urls: u64, hours_ago: f64, now_secs: f64) -> String {
+        let ts = chrono::DateTime::from_timestamp((now_secs - hours_ago * 3600.0) as i64, 0)
+            .unwrap()
+            .to_rfc3339();
+        serde_json::json!({"engine": engine, "urls": urls, "_at": ts}).to_string()
+    }
+    // now as (epoch seconds, hours) — units kept honest
+    fn now() -> (f64, f64) {
+        let s = 1_700_000_000.0;
+        (s, s / 3600.0)
+    }
+
+    #[test]
+    fn fresh_fail_streak_sidelines() {
+        let (now_s, now_h) = now();
+        let lines = vec![
+            row("ddg", 0, 0.1, now_s),
+            row("ddg", 0, 0.5, now_s),
+            row("ddg", 0, 1.0, now_s),
+            row("seznam", 4, 0.2, now_s),
+        ];
+        let s = engine_stats(&lines, now_h);
+        let (rate_d, fails_d, age_d) = s["ddg"];
+        assert_eq!(fails_d, 3);
+        assert!(engine_sidelined(fails_d, age_d));
+        let (rate_s, fails_s, _) = s["seznam"];
+        assert!(rate_s > 0.0 && fails_s == 0);
+        assert!(!engine_sidelined(fails_s, 0.2));
+    }
+
+    #[test]
+    fn stale_failures_parole() {
+        let (now_s, now_h) = now();
+        let lines = vec![
+            row("ddg", 0, 5.0, now_s),
+            row("ddg", 0, 6.0, now_s),
+            row("ddg", 0, 7.0, now_s),
+        ];
+        let s = engine_stats(&lines, now_h);
+        let (_, fails, age) = s["ddg"];
+        assert_eq!(fails, 3);
+        assert!(age > 2.0);
+        assert!(!engine_sidelined(fails, age), "old failures must not ban forever");
+    }
+
+    #[test]
+    fn success_resets_the_streak() {
+        let (now_s, now_h) = now();
+        let lines = vec![
+            row("ddg", 5, 0.1, now_s),
+            row("ddg", 0, 0.5, now_s),
+            row("ddg", 0, 1.0, now_s),
+        ];
+        let s = engine_stats(&lines, now_h);
+        assert_eq!(s["ddg"].1, 0);
+    }
+
+    #[test]
+    fn junk_lines_ignored() {
+        let now = 1_000_000.0;
+        let lines = vec!["not json".to_string(), row("ddg", 0, 0.1, now)];
+        let s = engine_stats(&lines, now);
+        assert_eq!(s["ddg"].1, 1);
     }
 }
