@@ -159,12 +159,25 @@ pub async fn chat_json(
     match extract_json(&txt) {
         Some((v, tooled)) => Some(mk(v, tooled)),
         // small models truncate mid-object when the token budget runs out;
-        // salvage the balanced prefix rather than losing the whole answer
+        // salvage the balanced prefix rather than losing the whole answer.
+        // Unsalvageable content logs its shape (finish/tokens/head): a
+        // no-response row must say whether the model said nothing or said
+        // it wrong (that blind spot once hid 3 timeouts among 16 rows).
         None => {
             if raw.trim().is_empty() {
+                eprintln!("llm: empty model content (finish={finish} toks={comp_tokens})");
                 return None;
             }
-            salvage_json(&raw).map(|v| mk(v, false))
+            match salvage_json(&raw) {
+                Some(v) => Some(mk(v, false)),
+                None => {
+                    eprintln!(
+                        "llm: unparseable model content (finish={finish} toks={comp_tokens}): {}",
+                        raw.chars().take(160).collect::<String>()
+                    );
+                    None
+                }
+            }
         }
     }
 }

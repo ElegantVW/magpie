@@ -1,6 +1,7 @@
 mod cli;
 mod crawl;
 mod db;
+mod docs;
 mod error;
 #[cfg(feature = "granary")]
 mod granary;

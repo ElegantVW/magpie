@@ -71,6 +71,21 @@ Three AI passes make magpie a producer, not a crawler:
 
 Append-only JSONL reserve under `~/.local/share/magpie/db/` (`MAGPIE_DB` overrides the parent): `dict.jsonl` (Wiktionary extracts), `thesaurus.jsonl` (entity + aliases per query), `translations.jsonl` (per-language hits), `expansions.jsonl` (spawned queries), `crawl.jsonl` (every crawled page's extracted text, keyed by URL). Raw-first, files-first: the house hoards now and rinses later.
 
+## Document retrieval
+
+When the crawl meets a catalog, datasheet, spreadsheet or book file, it
+downloads and extracts it instead of ingesting mojibake. Pure-Rust parsers
+only (`pdf-extract`, `zip`, `calamine`) — no system deps, no daemons, no
+executables ever touched. Archives (zip/rar/tar) are refused outright.
+
+Budgets: 20MB download ceiling (content-length gate + stream abort),
+400K-char extraction cap (uniform with book chunks), ≤8 doc links per
+second-hop (catalogs with 200 PDFs exist). IA books fall back
+`_djvu.txt` → EPUB → PDF (many items lack djvu.txt). A doc URL answering
+HTML (viewer/login wall) degrades to a page fetch instead of failing.
+Docs ride the same URL gates as pages; books keep the whole-work intake
+gate; the LLM relevance pass judges both.
+
 ## The rinse (audit, no LLM)
 
 `magpie rinse` re-examines finished runs deterministically: trigram-simhash
@@ -116,7 +131,7 @@ The C++ seam is owned, not depended on: `src/nose_shim.{h,cc}` (~200 lines, exce
 
 ## Thoroughness
 
-* Chain: DDG HTML POST → old-search Marginalia → Wikipedia family (en/de/pl/it) → `site:` verticals → sitemaps → Common Crawl WARC → Wikidata structured facts → IA books (whole-work intake gate) → 30-language fan-out → scored second-hop
+* Chain: measured engine pool (DDG + Marginalia + Seznam, yields ledgered, fail streaks sidelined) → Wikipedia family (en/de/pl/it) → `site:` verticals → sitemaps → Common Crawl WARC → Wikidata structured facts → IA books (whole-work intake gate, djvu→EPUB→PDF) → documents (PDF/EPUB/DOCX/XLSX/CSV, capped, bomb-guarded) → 30-language fan-out → scored second-hop
 * Every fetch measured into `fetch.jsonl` (outcome, status, bytes, ms, attempts): throttles retried once, failures kept as data; per-host roll-up in `seek.log`
 * Repetition is signal: near-dups kept as `dup_of` corroboration (`claimed_by ×N`), skipped by the LLM pass to save compute; locale mirrors collapse at URL level; long texts split by FastCDC content-defined seams (stable across re-crawls, verbatim-safe)
 * Gate: warns on `<4 pages`, `<3 hosts`, wiki-only, missing specs/faults. No PDF-only-from-wikipedia claim.
@@ -146,7 +161,8 @@ Python legacy retired to `~/bin/magpie-py-legacy` + `magpie_*.py-legacy`. See CH
 | `src/granary.rs` | DataFusion+Parquet lakehouse: press runs, rinse with SQL (feature `granary`) |
 | `src/judge.rs` | fact-check pass: claims → verification searches → verdict + appendix; unscored gate |
 | `src/db.rs` | programs database: JSONL amber + subject partitions + SHA manifests |
-| `src/crawl.rs` | search chain + measured fetch + intake gate + lexicon/marks + 30-language fan-out |
+| `src/docs.rs` | document retrieval: classify/download/extract PDF/EPUB/DOCX/XLSX/CSV (pure Rust, capped) |
+| `src/crawl.rs` | search chain + measured engine pool + measured fetch + intake gate + lexicon/marks + 30-language fan-out |
 | `src/seek.rs` | orchestrate + FastCDC chunking + dupes + diversity gate + dump.pdf |
 | `src/process.rs` | per-entry pixie pass (temp 0, stored scores) + heuristic warnings + manual.pdf |
 | `src/pdf.rs` | minimal local PDF writer: dump + structured manual |

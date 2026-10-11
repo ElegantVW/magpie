@@ -5,7 +5,9 @@
 - First number. Thorough seeker, producer arc live.
 
 
-## Unreleased — producer arc (release name: `nest-egg`, cut on the first APPROVED manual)
+## Unreleased
+- Measured engine pool: Seznam leg + per-engine yields ledger + fail-streak sideline with parole.
+- Document retrieval: PDF/EPUB/DOCX/XLSX/CSV download + extract (pure Rust, capped, bomb-guarded); IA books fall back djvu→EPUB→PDF.
 - Producer passes: LLM query expansion pre-crawl, 30-language Wikidata fan-out, post-crawl judge (text verdicts; APPROVED appends appendix, REDO costs no render).
 - Relevance that bites: subject-anchored scoring, distinguishing marks (years/engines/names), namesake filter, unscored-defaults-drop, per-entry scores stored.
 - Programs database: append-only JSONL amber + subject partitions + quarantine with reasons + SHA manifests (`manifest.json` merges seek → process → judge).

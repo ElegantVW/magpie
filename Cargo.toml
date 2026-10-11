@@ -22,7 +22,7 @@ granary = ["datafusion", "parquet", "arrow"]
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "io-util", "sync", "process"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 directories = "5"
@@ -35,9 +35,13 @@ fastcdc = "5"
 html-escape = "0.2"
 anyhow = "1"
 flate2 = "1"
+futures-util = "0.3"
 datafusion = { version = "55", optional = true }
 parquet = { version = "59", optional = true }
 arrow = { version = "59", optional = true }
+pdf-extract = "0.12.1"
+zip = "8"
+calamine = "0.36.1"
 
 [build-dependencies]
 cc = { version = "1", optional = true }

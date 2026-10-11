@@ -323,13 +323,147 @@ async fn fetch_one(url: &str) -> Result<Page> {
     res
 }
 
+/// Document fetch: download capped, content-type honored, text extracted.
+/// A doc URL answering HTML (viewer page, login wall) falls back to the
+/// page path — the server lied, not the link. Same ledger discipline as
+/// fetch_measured; outcome vocabulary gains "oversize".
+async fn fetch_doc_measured(url: &str, kind: crate::docs::DocKind) -> (Result<Page>, FetchRecord) {
+    let host = host_of(url);
+    let t0 = std::time::Instant::now();
+    let c = client();
+    let mut attempts = 0u8;
+    let mut status: Option<u16> = None;
+    let mut note = String::new();
+    for _ in 0..2 {
+        attempts += 1;
+        let r = match c.get(url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                note = format!("net:{}", e.to_string().chars().take(80).collect::<String>());
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+        let st = r.status().as_u16();
+        status = Some(st);
+        if st == 429 || st == 503 {
+            note = format!("{st} throttle");
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            continue;
+        }
+        if !r.status().is_success() {
+            note = format!("{st}");
+            break;
+        }
+        let ctype = r
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        // server answered HTML for a doc URL (viewer/landing/login page):
+        // fetch it as a page instead of failing the link
+        if ctype.contains("html") {
+            return fetch_measured(url).await;
+        }
+        // content-length gate first (never download blind into 20MB+)
+        if let Some(len) = r.headers().get("content-length").and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<u64>().ok()) {
+            if len > crate::docs::DOC_MAX_BYTES {
+                let rec = FetchRecord {
+                    url: url.to_string(),
+                    host,
+                    outcome: "oversize".into(),
+                    status,
+                    bytes: 0,
+                    ms: t0.elapsed().as_millis() as u64,
+                    attempts,
+                    note: format!("content-length:{len}"),
+                };
+                return (Err(MagpieError::Network(format!("oversize {len}b {url}"))), rec);
+            }
+        }
+        // stream with a hard ceiling (chunked bodies carry no length)
+        use futures_util::StreamExt as _;
+        let mut bytes: Vec<u8> = vec![];
+        let mut over = false;
+        let mut stream = r.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(b) => {
+                    bytes.extend_from_slice(&b);
+                    if bytes.len() as u64 > crate::docs::DOC_MAX_BYTES {
+                        over = true;
+                        break;
+                    }
+                }
+                Err(e) => {
+                    note = format!("body:{e}");
+                    break;
+                }
+            }
+        }
+        if over {
+            let rec = FetchRecord {
+                url: url.to_string(),
+                host,
+                outcome: "oversize".into(),
+                status,
+                bytes: bytes.len() as u64,
+                ms: t0.elapsed().as_millis() as u64,
+                attempts,
+                note: "stream-ceiling".into(),
+            };
+            return (Err(MagpieError::Network(format!("oversize stream {url}"))), rec);
+        }
+        let nbytes = bytes.len() as u64;
+        // content-type may refine the kind (server truth beats URL guess),
+        // but never downgrades to HTML here (handled above)
+        let kind = crate::docs::classify_ctype(&ctype).unwrap_or(kind);
+        match crate::docs::extract(kind, &bytes) {
+            Ok(text) => {
+                let chars = text.chars().count();
+                let title = crate::docs::title_for(url, kind);
+                let rec = FetchRecord {
+                    url: url.to_string(),
+                    host,
+                    outcome: "ok".into(),
+                    status,
+                    bytes: nbytes,
+                    ms: t0.elapsed().as_millis() as u64,
+                    attempts,
+                    note: format!("{} {}c", crate::docs::kind_suffix(kind).to_lowercase(), chars),
+                };
+                return (
+                    Ok(Page { url: url.to_string(), title, text: text.clone(), chars, dup_of: None }),
+                    rec,
+                );
+            }
+            Err(e) => {
+                note = e.chars().take(80).collect();
+                break;
+            }
+        }
+    }
+    let rec = FetchRecord {
+        url: url.to_string(),
+        host,
+        outcome: "fail".into(),
+        status,
+        bytes: 0,
+        ms: t0.elapsed().as_millis() as u64,
+        attempts,
+        note,
+    };
+    (Err(MagpieError::Network(format!("{} {url}", rec.note))), rec)
+}
+
 /// One ledger line per fetch attempt-chain. Failures are data: throttles,
 /// blocks and dead hosts are what the next run plans around.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FetchRecord {
     pub url: String,
     pub host: String,
-    /// ok | thin | fail | robots | non-html | bulk
+    /// ok | thin | fail | robots | non-html | bulk | oversize
     pub outcome: String,
     pub status: Option<u16>,
     pub bytes: u64,
@@ -863,9 +997,10 @@ async fn ia_books(search_q: &str, subject_q: &str, card: &QueryCard, prog: &Opti
         if id.is_empty() {
             continue;
         }
-        // metadata: only proceed with a real full-text file present.
-        // NOTE: newer items name files by title, not identifier —
-        // resolve the exact _djvu.txt from the file list, never guess.
+        // metadata: resolve a full-text file, preferring _djvu.txt, then
+        // EPUB, then PDF (many items lack djvu.txt but ship the others —
+        // refusing them all starves the canon). NOTE: newer items name files
+        // by title, not identifier — resolve exact names, never guess.
         let meta = match c.get(&format!("https://archive.org/metadata/{id}")).send().await {
             Ok(r) => r.text().await.unwrap_or_default(),
             Err(_) => {
@@ -873,51 +1008,88 @@ async fn ia_books(search_q: &str, subject_q: &str, card: &QueryCard, prog: &Opti
                 continue;
             }
         };
-        let txt_name: Option<String> = (|| {
+        // (file name, is_plain_text): djvu.txt reads as text, the rest parse
+        let txt_name: Option<(String, bool)> = (|| {
             let v: serde_json::Value = serde_json::from_str(&meta).ok()?;
-            let mut cands: Vec<String> = vec![];
-            for f in v.get("files")?.as_array()? {
-                let n = f.get("name")?.as_str()?;
-                if n.ends_with("_djvu.txt") {
-                    cands.push(n.to_string());
+            let files = v.get("files")?.as_array()?;
+            let mut pick = |sufs: &[&str]| -> Option<String> {
+                let mut cands: Vec<String> = vec![];
+                for f in files {
+                    let n = f.get("name")?.as_str()?;
+                    if sufs.iter().any(|s| n.ends_with(s)) {
+                        cands.push(n.to_string());
+                    }
                 }
+                // prefer the identifier-stemmed file, else first candidate
+                cands
+                    .iter()
+                    .find(|n| n.starts_with(&id))
+                    .cloned()
+                    .or_else(|| cands.into_iter().next())
+            };
+            if let Some(n) = pick(&["_djvu.txt"]) {
+                return Some((n, true));
             }
-            // prefer the identifier-stemmed file, else first candidate
-            cands
-                .iter()
-                .find(|n| n.starts_with(&id))
-                .cloned()
-                .or_else(|| cands.into_iter().next())
+            if let Some(n) = pick(&[".epub"]) {
+                return Some((n, false));
+            }
+            // any pdf: extraction decides (scanned-image PDFs come back
+            // empty and die at the thin gate with cause)
+            if let Some(n) = pick(&[".pdf"]) {
+                return Some((n, false));
+            }
+            None
         })();
-        let txt_name = match txt_name {
+        let (txt_name, is_text) = match txt_name {
             Some(n) => n,
             None => {
                 refuse(&id, &title, "no-fulltext".into());
                 continue;
             }
         };
-        let body = match c.get(&format!("https://archive.org/download/{id}/{txt_name}")).send().await {
-            Ok(r) => {
-                // restricted/lending items answer 403 with an error page —
-                // never ingest those as book text
-                if !r.status().is_success() {
-                    refuse(&id, &title, format!("restricted:{}", r.status().as_u16()));
+        let text: String = if is_text {
+            let body = match c.get(&format!("https://archive.org/download/{id}/{txt_name}")).send().await {
+                Ok(r) => {
+                    // restricted/lending items answer 403 with an error page —
+                    // never ingest those as book text
+                    if !r.status().is_success() {
+                        refuse(&id, &title, format!("restricted:{}", r.status().as_u16()));
+                        continue;
+                    }
+                    r.text().await.unwrap_or_default()
+                }
+                Err(_) => {
+                    refuse(&id, &title, "download-failed".into());
                     continue;
                 }
-                r.text().await.unwrap_or_default()
-            }
-            Err(_) => {
-                refuse(&id, &title, "download-failed".into());
+            };
+            if body.contains("Page not found on Internet Archive") {
+                refuse(&id, &title, "not-found".into());
                 continue;
             }
+            // full text, not a sample: books are chunked downstream, and
+            // runtime no longer matters more than coverage (cap ~400KB)
+            body.chars().take(400_000).collect()
+        } else {
+            // EPUB/PDF full text through the doc pipeline (same caps,
+            // same bomb guards as web documents)
+            let file_url = format!("https://archive.org/download/{id}/{txt_name}");
+            let kind = if txt_name.ends_with(".epub") {
+                crate::docs::DocKind::Epub
+            } else {
+                crate::docs::DocKind::Pdf
+            };
+            match fetch_doc_measured(&file_url, kind).await {
+                (Ok(p), _) => {
+                    // retitle to the WORK (file stems are noise)
+                    p.text
+                }
+                (Err(_), rec) => {
+                    refuse(&id, &title, format!("bookfile:{}", rec.note.chars().take(40).collect::<String>()));
+                    continue;
+                }
+            }
         };
-        if body.contains("Page not found on Internet Archive") {
-            refuse(&id, &title, "not-found".into());
-            continue;
-        }
-        // full text, not a sample: books are chunked downstream, and
-        // runtime no longer matters more than coverage (cap ~400KB)
-        let text: String = body.chars().take(400_000).collect();
         if text.chars().count() < 2000 {
             refuse(&id, &title, format!("thin:{}c", text.chars().count()));
             continue;
@@ -2319,7 +2491,43 @@ pub async fn crawl_urls(urls: &[String], prog: Option<tokio::sync::mpsc::Unbound
                 return (None, Some(rec));
             }
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            match fetch_measured(&u).await {
+            // document route: catalogs, datasheets, spreadsheets and book
+            // files download through the doc pipeline (extracted, gated by
+            // the same URL model-gate as pages — file stems carry query
+            // tokens the same way; density judgment stays with the LLM
+            // relevance pass downstream, exactly like web pages).
+            if let Some(kind) = crate::docs::classify_url(&u) {
+                match fetch_doc_measured(&u, kind).await {
+                    (Ok(p), rec) => {
+                        if p.text.chars().count() < 200 {
+                            if let Some(tx) = &prog {
+                                let _ = tx.send(format!("skip {}/{} (thin doc)", i + 1, total));
+                            }
+                            let mut rec = rec;
+                            rec.outcome = "thin".into();
+                            crate::db::append("fetch", serde_json::to_value(&rec).unwrap_or_default());
+                            return (None, Some(rec));
+                        }
+                        crate::db::append(
+                            "crawl",
+                            serde_json::json!({"url": p.url, "title": p.title, "chars": p.chars, "text": p.text}),
+                        );
+                        crate::db::append("fetch", serde_json::to_value(&rec).unwrap_or_default());
+                        if let Some(tx) = &prog {
+                            let _ = tx.send(format!("got {}/{} {}c doc", i + 1, total, p.chars));
+                        }
+                        (Some((i, p)), Some(rec))
+                    }
+                    (Err(_), rec) => {
+                        crate::db::append("fetch", serde_json::to_value(&rec).unwrap_or_default());
+                        if let Some(tx) = &prog {
+                            let _ = tx.send(format!("fail {}/{} doc ({} {})", i + 1, total, rec.status.map(|s| s.to_string()).unwrap_or_else(|| "net".into()), rec.note.chars().take(30).collect::<String>()));
+                        }
+                        (None, Some(rec))
+                    }
+                }
+            } else {
+                match fetch_measured(&u).await {
                 (Ok(p), rec) => {
                     if p.text.chars().count() < 200 {
                         if let Some(tx) = &prog {
@@ -2348,6 +2556,7 @@ pub async fn crawl_urls(urls: &[String], prog: Option<tokio::sync::mpsc::Unbound
                         let _ = tx.send(format!("fail {}/{} ({} {})", i + 1, total, rec.status.map(|s| s.to_string()).unwrap_or_else(|| "net".into()), rec.note.chars().take(30).collect::<String>()));
                     }
                     (None, Some(rec))
+                }
                 }
             }
         }));
@@ -2487,6 +2696,16 @@ pub async fn expand_second_hop(query: &str, pages: &[Page], max_extra: usize) ->
     use std::collections::HashSet;
     let mut seen: HashSet<String> = pages.iter().map(|p| canon_url(&p.url)).collect();
     let mut scored: Vec<(i32, String)> = vec![];
+    // boost tokens from the QUERY (subject-agnostic): the old hardcoded car
+    // list boosted opel/corsa on hermeticism runs. Generic doc-ish words stay.
+    let qtokens: Vec<String> = query
+        .to_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| t.len() > 2)
+        .map(|t| t.to_string())
+        .collect();
+    let generic = ["spec", "manual", "guide", "review", "problem", "recall", "datasheet", "catalog", "handbook", "treatise"];
+    let boosts: Vec<String> = qtokens.into_iter().chain(generic.iter().map(|s| s.to_string())).collect();
     let re = Regex::new(r#"(?i)href\s*=\s*"(https?://[^"]+)""#).unwrap();
     for p in pages {
         let html = fetch_raw(&p.url).await.unwrap_or_default();
@@ -2516,8 +2735,8 @@ pub async fn expand_second_hop(query: &str, pages: &[Page], max_extra: usize) ->
                 continue;
             }
             let mut score = boost_host(&host_of(&u));
-            for kw in ["opel", "corsa", "cdti", "multijet", "jtd", "diesel", "fiat", "vauxhall", "auto", "motor", "car", "transit", "focus", "spec", "reliability", "dimension", "engine"] {
-                if lu.contains(kw) {
+            for tok in boosts.iter() {
+                if lu.contains(&tok[..]) {
                     score += 2;
                 }
             }
@@ -2529,7 +2748,23 @@ pub async fn expand_second_hop(query: &str, pages: &[Page], max_extra: usize) ->
         }
     }
     scored.sort_by(|a, b| b.0.cmp(&a.0));
-    scored.into_iter().take(max_extra).map(|(_, u)| u).collect()
+    // catalogs link hundreds of PDFs: cap doc-classified links so one
+    // index page can't flood the run (each still capped at 20MB downstream)
+    let mut docs = 0usize;
+    let mut out = vec![];
+    for (_, u) in scored {
+        if crate::docs::classify_url(&u).is_some() {
+            if docs >= 8 {
+                continue;
+            }
+            docs += 1;
+        }
+        out.push(u);
+        if out.len() >= max_extra {
+            break;
+        }
+    }
+    out
 }
 
 async fn fetch_raw(url: &str) -> std::result::Result<String, ()> {
