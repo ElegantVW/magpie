@@ -44,46 +44,24 @@ async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, ch
     let user = format!(
         "{{\"task\": \"classify\", \"title\": \"{title}\", \"url\": \"{base}\", \"text\": \"{excerpt}\", \"want\": {{\"kind\": \"spec|fault|review|dimensions|facts|howto|reference|history|other\", \"relevance\": \"0-100 fit to the subject\", \"section\": \"one of: {chlist}\", \"bullets\": [\"up to 10 facts\"], \"specs\": [[\"key\", \"value\"] up to 12], \"quotes\": [\"up to 3 verbatim spans\"]}}}}"
     );
-    let body = serde_json::json!({
-        "messages": [{"role": "system", "content": sys}, {"role": "user", "content": user}],
-        // scoring must be deterministic: llama-server seeds randomly per
-        // boot, and a 0.1 lottery once dropped an entire manual (intake run)
-        "temperature": 0.0,
-        "max_tokens": 700,
-        "response_format": {"type": "json_object"},
-        "tools": [{
-            "type": "function",
-            "function": {
-                "name": "classify_entry",
-                "description": "File one crawled page into the vehicle manual",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "kind": {"type": "string", "enum": ["spec", "fault", "review", "dimensions", "facts", "howto", "reference", "history", "other"]},
-                        "relevance": {"type": "integer", "minimum": 0, "maximum": 100},
-                        "bullets": {"type": "array", "items": {"type": "string"}, "maxItems": 10},
-                        "specs": {"type": "array", "items": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 2}, "maxItems": 12},
-                        "quotes": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
-                        "section": {"type": "string"}
-                    },
-                    "required": ["kind", "bullets", "specs", "quotes", "relevance", "section"]
-                }
-            }
-        }],
-        "tool_choice": {"type": "function", "function": {"name": "classify_entry"}},
-    });
-    let mut attempt = crate::llm::chat_json(client, endpoint, &sys, &user, 700, 0.1).await;
+    // NOTE: no tools/tool_choice block is sent, by design and by evidence.
+    // This server build never returns tool_calls (dozens of forced
+    // tool_choice probes all came back envelope-style), and an unsent tools
+    // block once sat here as dead code while the real temperature (0.1, in
+    // the calls below) hid behind a dead 0.0. The {"name","arguments"}
+    // envelope is the contract; the want-block shapes it. chat_json builds
+    // the payload from sys/user/params — there is no other body.
+    let mut attempt = crate::llm::chat_json(client, endpoint, &sys, &user, 700, 0.0).await;
     if attempt.is_none() {
-        // model may have been idle-evicted mid-run: summon its slot once, retry once
+        // model may have been idle-evicted mid-run: summon its slot once, retry once.
+        // Backend (cpu/gpu) is the steward's business (`menagerie backend magpie ...`);
+        // magpie passes no GPU env — an env override here once masked a CPU-started
+        // slot for a week because ensure is a no-op when healthy.
         let mut cmd = tokio::process::Command::new("menagerie");
         cmd.args(["ensure", &crate::llm::llm_app()]);
-        if std::env::var("MAGPIE_GPU").map(|v| v != "0").unwrap_or(true) {
-            cmd.env("PIXIE_LLAMA_SERVER", format!("{}/.local/lib/llama-vulkan/llama-server-vk", std::env::var("HOME").unwrap_or_else(|_| "/home/evenweaker".into())));
-            cmd.env("PIXIE_LLM_NGL", "99");
-        }
         let _ = cmd.output().await;
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        attempt = crate::llm::chat_json(client, endpoint, &sys, &user, 700, 0.1).await;
+        attempt = crate::llm::chat_json(client, endpoint, &sys, &user, 700, 0.0).await;
     }
     // tool contract first (real function call), envelope/content JSON after.
     // Heuristic never silent.

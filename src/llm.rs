@@ -9,18 +9,12 @@ pub fn llm_app() -> String {
 /// Resolve the inference endpoint through menagerie (the house control
 /// plane): ensure the app slot, then read its URL. Falls back to
 /// PIXIE_LLM_URL, then pixie's :8080. Returns (url, via_tag).
+/// Backend (cpu/gpu) is configured per-creature in the steward
+/// (`menagerie backend magpie gpu`) — magpie passes no GPU env of its own.
 pub async fn llm_endpoint() -> (String, String) {
     let app = llm_app();
-    // GPU: the house Vulkan server + offload travel with the ensure call,
-    // so the magpie slot stays GPU-backed across evictions/restarts.
-    // Opt out with MAGPIE_GPU=0 (falls back to default CPU binary).
-    let gpu = std::env::var("MAGPIE_GPU").map(|v| v != "0").unwrap_or(true);
     let mut cmd = tokio::process::Command::new("menagerie");
     cmd.args(["ensure", &app]);
-    if gpu {
-        cmd.env("PIXIE_LLAMA_SERVER", format!("{}/.local/lib/llama-vulkan/llama-server-vk", std::env::var("HOME").unwrap_or_else(|_| "/home/evenweaker".into())));
-        cmd.env("PIXIE_LLM_NGL", "99");
-    }
     let out = cmd.output().await;
     if out.map(|o| o.status.success()).unwrap_or(false) {
         if let Ok(p) = tokio::process::Command::new("menagerie")

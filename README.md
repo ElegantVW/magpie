@@ -22,12 +22,13 @@ llama.cpp is built with Vulkan (`~/.local/src/llama.cpp`, headers in
 `~/.local/vulkan-deps`). The server lives at
 `~/.local/lib/llama-vulkan/` (`llama-server-vk` wrapper sets
 `LD_LIBRARY_PATH`); the stock `~/bin/llama-server` is untouched.
-The magpie slot runs `qwen3-4b` on the RX 5700 XT
-(`PIXIE_LLAMA_SERVER=…/llama-server-vk PIXIE_LLM_NGL=99 menagerie set magpie …`).
-Per-entry latency follows server speed (fast days well under a minute,
-slow days minutes) — budgets cover bad days (600s LLM round-trips), and
-failures log to stderr, never silent: a 30s client timeout once filled a
-whole manual with unscored fallback entries before anyone noticed.
+The magpie slot runs `qwen3-4b` with GPU inference through menagerie
+(`menagerie backend magpie gpu` → house Vulkan server + full offload;
+`cpu` for the stock fallback). Backend is per-creature steward business —
+magpie passes no GPU env of its own (an env override once masked a
+CPU-started slot for a week because ensure is a no-op when healthy).
+Per-entry latency follows server speed; budgets cover bad days (600s LLM
+round-trips), and failures log to stderr, never silent.
 `process` passes that env on every `ensure`, so the slot self-heals
 GPU-backed across evictions. Opt out with `MAGPIE_GPU=0`.
 Switch models with `menagerie set magpie <name>`; pick the app with
