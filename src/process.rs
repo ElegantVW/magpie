@@ -87,8 +87,8 @@ async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, ch
     }
     // tool contract first (real function call), envelope/content JSON after.
     // Heuristic never silent.
-    let (v, tooled) = match attempt {
-        Some((v, tooled)) => (v, tooled),
+    let out = match attempt {
+        Some(o) => o,
         None => {
             // both tries failed (timeout, eviction, down slot): on the
             // record, with identity — silent fallbacks filled a manual once
@@ -98,11 +98,13 @@ async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, ch
             return (k, b, s, q, sec, via, -1);
         }
     };
+    let (v, tooled) = (out.v, out.tooled);
     // failure telemetry for the unparseable path below: finish reason
-    // ("length" = max_tokens cut) and token counts travel with the raw head
-    let finish: String = v["choices"][0].get("finish_reason").and_then(|f| f.as_str()).unwrap_or("").into();
-    let comp_tokens: u64 = v["usage"].get("completion_tokens").and_then(|n| n.as_u64()).unwrap_or(0);
-    let raw_head: String = v["choices"][0]["message"].get("content").and_then(|c| c.as_str()).unwrap_or("").chars().take(2000).collect();
+    // ("length" = max_tokens cut), token counts, raw head — all traveling
+    // in the ChatOut envelope (the inner value never had them; that blind
+    // spot once logged 16 empty rows).
+    let (finish, comp_tokens) = (out.finish, out.comp_tokens);
+    let raw_head: String = out.raw.chars().take(2000).collect();
     let parsed: Option<(String, Vec<String>, Vec<[String; 2]>, Vec<String>, String, bool, i64)> = (|| {
         // v resolved by llm::chat_json (tool contract → envelope → content)
         let raw_kind = v.get("kind").and_then(|k| k.as_str()).unwrap_or("other").to_lowercase();

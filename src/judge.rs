@@ -142,9 +142,9 @@ pub async fn run_judge(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc::
     // generous budget: 10 pairs of evidence in, 10 terse verdicts out.
     // 600 tokens truncated mid-JSON (parse then fails → unreachable).
     // ctx 8192 fits ~5K prompt + 1500 generation.
-    if let Some((val, tooled)) = crate::llm::chat_json(&client, &endpoint, sys, &user, 1500, 0.1).await {
-        let _ = tooled;
-        judgment = val;
+    if let Some(o) = crate::llm::chat_json(&client, &endpoint, sys, &user, 1500, 0.1).await {
+        let _ = o.tooled;
+        judgment = o.v;
         judge_via = Box::leak(format!("{via_tag}:judge").into_boxed_str());
     }
     let overall = judgment.get("overall").and_then(|o| o.as_str()).unwrap_or("REDO").to_string();

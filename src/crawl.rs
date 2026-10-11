@@ -1672,8 +1672,8 @@ pub async fn plan_urls(
             "want": {"queries": ["6-10 distinct web search queries: subtopics, alias forms, key figures, technique queries"]}
         })
         .to_string();
-        if let Some((v, _)) = crate::llm::chat_json(&client, &endpoint, sys, &user, 300, 0.2).await {
-            if let Some(arr) = v.get("queries").and_then(|q| q.as_array()) {
+        if let Some(o) = crate::llm::chat_json(&client, &endpoint, sys, &user, 300, 0.2).await {
+            if let Some(arr) = o.v.get("queries").and_then(|q| q.as_array()) {
                 for q in arr.iter().take(10) {
                     if let Some(s) = q.as_str() {
                         let s = s.trim().to_string();

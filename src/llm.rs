@@ -86,6 +86,18 @@ pub fn extract_json(txt: &str) -> Option<(serde_json::Value, bool)> {
     Some((v, false))
 }
 
+/// What one enforced-JSON round trip yields: the parsed value, how it
+/// arrived, and the envelope forensics (finish reason, token counts, raw
+/// model text). The forensics travel even on failure paths — truncation
+/// diagnosis needs them exactly when parsing fails.
+pub struct ChatOut {
+    pub v: serde_json::Value,
+    pub tooled: bool,
+    pub finish: String,
+    pub comp_tokens: u64,
+    pub raw: String,
+}
+
 /// Convenience: system + user + enforced JSON object, parsed or None.
 pub async fn chat_json(
     client: &reqwest::Client,
@@ -94,7 +106,7 @@ pub async fn chat_json(
     user: &str,
     max_tokens: u32,
     temperature: f32,
-) -> Option<(serde_json::Value, bool)> {
+) -> Option<ChatOut> {
     let body = serde_json::json!({
         "messages": [{"role": "system", "content": sys}, {"role": "user", "content": user}],
         "temperature": temperature,
@@ -111,15 +123,34 @@ pub async fn chat_json(
             return None;
         }
     };
+    let root: serde_json::Value = serde_json::from_str(&txt).unwrap_or(serde_json::Value::Null);
+    let finish = root["choices"][0]
+        .get("finish_reason")
+        .and_then(|f| f.as_str())
+        .unwrap_or("")
+        .to_string();
+    let comp_tokens = root["usage"].get("completion_tokens").and_then(|n| n.as_u64()).unwrap_or(0);
+    let raw = root["choices"][0]["message"]
+        .get("content")
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .to_string();
+    let mk = |v: serde_json::Value, tooled: bool| ChatOut {
+        v,
+        tooled,
+        finish: finish.clone(),
+        comp_tokens,
+        raw: raw.clone(),
+    };
     match extract_json(&txt) {
-        Some(pair) => Some(pair),
+        Some((v, tooled)) => Some(mk(v, tooled)),
         // small models truncate mid-object when the token budget runs out;
         // salvage the balanced prefix rather than losing the whole answer
         None => {
-            let content = serde_json::from_str::<serde_json::Value>(&txt)
-                .ok()
-                .and_then(|v| v["choices"][0]["message"]["content"].as_str().map(|s| s.to_string()))?;
-            salvage_json(&content).map(|v| (v, false))
+            if raw.trim().is_empty() {
+                return None;
+            }
+            salvage_json(&raw).map(|v| mk(v, false))
         }
     }
 }
