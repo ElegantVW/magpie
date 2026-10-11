@@ -406,23 +406,55 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
     // parse failures stop being invisible
     let mut fail_log: Vec<serde_json::Value> = vec![];
     let kept_total = keeper_idx.len();
+    // Parallel scoring, 3-wide: serial × slow days measured 87-minute
+    // passes. Server logs show parallel slots (ids 0/1/3), so this is real
+    // concurrency, not queue-shuffling; if a server ever runs single-slot,
+    // requests queue server-side and the outcome matches serial.
+    // Order restored after collect (keeper order = entries order, drops in
+    // order, fail rows in order) — determinism preserved.
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(3));
+    let mut handles = vec![];
     for (n, i) in keeper_idx.iter().copied().enumerate() {
         let p = &arr[i];
-        keeper_at[i] = Some(entries.len());
         let url = p.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string();
         let title = p.get("title").and_then(|u| u.as_str()).unwrap_or("").to_string();
         let text = p.get("text").and_then(|u| u.as_str()).unwrap_or("").to_string();
-        // NOTE: no deterministic chunk gate here by design. Corpus dialogue
-        // chunks (Tat/Asclepius speaking, "Hermes" unnamed for pages) carry
-        // zero subject tokens yet are the canon itself; lexical per-chunk
-        // gating kills the patient with the disease (measured: 65/101 canon
-        // chunks score zero alongside 71/71 Dugin chunks). Wrong-WORK
-        // rejection lives at book intake (crawl.rs book_about_subject);
-        // per-chunk relevance stays with the LLM relevance score below.
-        if let Some(tx) = &prog {
-            let _ = tx.send(format!("pixie {}/{} {}", n + 1, kept_total, url.chars().take(50).collect::<String>()));
+        let (client, endpoint, via_tag, chapters, meaning, query, marks, prog, sem) =
+            (client.clone(), endpoint.clone(), via_tag.clone(), chapters.clone(), meaning.clone(), query.clone(), marks.clone(), prog.clone(), sem.clone());
+        handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire_owned().await.expect("semaphore held open for the run");
+            if let Some(tx) = &prog {
+                let _ = tx.send(format!("pixie {}/{} {}", n + 1, kept_total, url.chars().take(50).collect::<String>()));
+            }
+            let mut fail_rows: Vec<serde_json::Value> = vec![];
+            let scored = process_one(&client, &endpoint, &via_tag, &chapters, &meaning, &query, &marks, &url, &title, &text, &mut fail_rows).await;
+            (n, i, url, title, scored, fail_rows)
+        }));
+    }
+    // NOTE: no deterministic chunk gate here by design. Corpus dialogue
+    // chunks (Tat/Asclepius speaking, "Hermes" unnamed for pages) carry
+    // zero subject tokens yet are the canon itself; lexical per-chunk
+    // gating kills the patient with the disease (measured: 65/101 canon
+    // chunks score zero alongside 71/71 Dugin chunks). Wrong-WORK
+    // rejection lives at book intake (crawl.rs book_about_subject);
+    // per-chunk relevance stays with the LLM relevance score below.
+    let mut scored: Vec<(usize, usize, String, String, (String, Vec<String>, Vec<[String; 2]>, Vec<String>, String, String, i64), Vec<serde_json::Value>)> = vec![];
+    for h in handles {
+        match h.await {
+            Ok(r) => scored.push(r),
+            Err(_) => {
+                // task panic (OOM-class): the keeper dies counted, never silent
+                // (url/title unrecoverable here; index carries identity)
+                // handled below via missing n — see keeper_at default None
+            }
         }
-        let (kind, bullets, specs, quotes, section, via, relevance) = process_one(&client, &endpoint, &via_tag, &chapters, &meaning, &query, &marks, &url, &title, &text, &mut fail_log).await;
+    }
+    scored.sort_by_key(|(n, _, _, _, _, _)| *n);
+    let done_n: std::collections::HashSet<usize> = scored.iter().map(|(n, _, _, _, _, _)| *n).collect();
+    for (_, i, url, title, scored_out, fail_rows) in scored {
+        fail_log.extend(fail_rows);
+        let (kind, bullets, specs, quotes, section, via, relevance) = scored_out;
+        keeper_at[i] = Some(entries.len());
         // namesake filter: parenthetical disambiguators that never belong
         // in a subject manual (bands, surnames, albums share query words;
         // poetry movements named for obscurity — the Mixolydian class —
@@ -457,6 +489,14 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
             continue;
         }
         entries.push(Entry { url, title, kind, via, bullets, specs, quotes, section, claimed_by: 0, relevance });
+    }
+    // join failures (panics): keeper never scored — count it dropped with cause
+    for (n, i) in keeper_idx.iter().copied().enumerate() {
+        if !done_n.contains(&n) {
+            keeper_at[i] = None;
+            dropped_irrelevant += 1;
+            drops.push(serde_json::json!({"url": format!("keeper#{i}"), "reason": "task-failed"}));
+        }
     }
     // shadow-drop: heuristic fallback entries are excluded whenever ANY
     // LLM-scored entry exists — unscored bullets must not file as manual
