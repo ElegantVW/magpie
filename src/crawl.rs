@@ -134,6 +134,47 @@ pub fn subject_lexicon(query: &str, card: &QueryCard) -> Vec<String> {
 /// Book-level intake: the whole work must be ABOUT the subject. Title or
 /// front matter must name it, and the full text must mention it densely.
 /// One passing mention deep in an unrelated volume never qualifies.
+/// Is this candidate a PERIODICAL/CONTAINER rather than a work about the
+/// subject? A magazine issue ("New Scientist 28 March 2015") mentions the
+/// subject plenty — often dozens of times across 400K chars — so the
+/// on-subject gate below waves it through, and then EVERY chunk competes:
+/// the bomb-tests-in-Antarctic-snow chunk scored 45 and entered a black-hole
+/// manual. Containers are refused outright: a manual wants works ABOUT the
+/// subject, and per-chunk scoring cannot tell an article from the issue
+/// around it (lexical chunk gating kills canon; this is the intake-level
+/// answer instead). Signal is the TITLE only — a monograph never titles
+/// itself "Vol 4" or "March 2015".
+fn is_periodical(title: &str) -> bool {
+    let t = title.to_lowercase();
+    // strip the site suffix magpie appends (" — Internet Archive")
+    let t = t.split("—").next().unwrap_or(&t);
+    // explicit volume/issue/number markers
+    for pat in [
+        r"\bvol\.?\s*\d+",
+        r"\bno\.?\s*\d+",
+        r"\bnos\.?\s*\d+",
+        r"\bissue\s*\d+",
+        r"\bnumber\s*\d+",
+        r"\bnr\.?\s*\d+",
+        r"\bissue\s*#?\s*\d{1,4}\b",
+        r"\d+\s*(?:st|nd|rd|th)\s+(?:january|february|march|april|may|june|july|august|september|october|november|december)\b",
+    ] {
+        if Regex::new(pat).unwrap().is_match(t) {
+            return true;
+        }
+    }
+    // bare "March 2015" / "Mar 2015" — a month-year dateline
+    let months = "january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec";
+    if Regex::new(&format!(r"\b(?:{months})\.?\s+(?:19|20)\d{{2}}\b")).unwrap().is_match(t) {
+        return true;
+    }
+    // ISO-ish date or a bare year in a periodical-ish context
+    if Regex::new(r"\b(?:19|20)\d{2}-\d{2}-\d{2}\b").unwrap().is_match(t) {
+        return true;
+    }
+    false
+}
+
 fn book_about_subject(title: &str, head: &str, text_lt: &str, lex: &[String]) -> bool {
     let titled = title.to_lowercase();
     if !lex.iter().any(|t| titled.contains(&t[..]) || head.contains(&t[..])) {
@@ -1107,6 +1148,13 @@ async fn ia_books(search_q: &str, subject_q: &str, card: &QueryCard, prog: &Opti
         let lex = subject_lexicon(subject_q, card);
         let lt = text.to_lowercase();
         let head: String = text.chars().take(1500).collect::<String>().to_lowercase();
+        // containers first: a magazine issue is not a work ABOUT the
+        // subject however densely the subject is mentioned inside it.
+        if is_periodical(&title) {
+            send(&format!("search: archive.org skip {title} (periodical container)"));
+            refuse(&id, &title, "periodical".into());
+            continue;
+        }
         if !book_about_subject(&title, &head, &lt, &lex) {
             send(&format!("search: archive.org skip {title} (off-subject)"));
             refuse(&id, &title, "off-subject".into());
@@ -3579,5 +3627,35 @@ mod tier2_tests {
         assert_eq!(se_sites("margarita cocktail", "field"), vec!["cooking", "alcohol"]);
         assert_eq!(se_sites("lisbon", "place"), vec!["travel"]);
         assert_eq!(se_sites("hermeticism", "field"), vec!["philosophy", "history"]);
+    }
+}
+
+#[cfg(test)]
+mod periodical_tests {
+    use super::is_periodical;
+
+    #[test]
+    fn catches_the_container_that_sank_black_hole() {
+        assert!(is_periodical("New Scientist 28 March 2015 — Internet Archive"));
+        assert!(is_periodical("Nature Vol 512, No 3"));
+        assert!(is_periodical("Journal of Cosmology, issue 45"));
+        assert!(is_periodical("Scientific American December 1998"));
+        assert!(is_periodical("AIAA Journal vol. 9 no. 4"));
+        assert!(is_periodical("Der Spiegel 2021-03-28"));
+        assert!(is_periodical("The Lancet, 1st May 1902"));
+    }
+
+    #[test]
+    fn real_works_never_look_like_issues() {
+        // the four APPROVED manuals' actual books must survive
+        assert!(!is_periodical("Corpus Hermeticum — Internet Archive"));
+        assert!(!is_periodical("The Cocktail Book — Internet Archive"));
+        assert!(!is_periodical("Fatal Youth Of The Universe Black Hole Threat"));
+        assert!(!is_periodical("Black Holes — Internet Archive"));
+        assert!(!is_periodical("A History of Lisbon"));
+        // "may" as a word, "vol" inside a word, bare years
+        assert!(!is_periodical("You May Find It Interesting"));
+        assert!(!is_periodical("Revolutions per volume of fluid"));
+        assert!(!is_periodical("Gravity 2015 Retrospective"));
     }
 }
