@@ -1171,12 +1171,50 @@ async fn translations(query: &str, prog: &Option<tokio::sync::mpsc::UnboundedSen
 /// Verification search for the judge: distinct query per claim,
 /// top hits only. Part of the ≥10-searches-of-our-own evidence round.
 pub(crate) async fn verify_search(claim: &str) -> Vec<String> {
-    let q: String = claim.chars().take(80).collect();
-    let mut out = ddg_search_tries(&q, 3, 2, 10).await;
-    if out.is_empty() {
-        out = marginalia_tries(&q, 3, 2, 10).await;
+    let full: String = claim.chars().take(80).collect();
+    let mut out = search_clean(&full).await;
+    if out.len() < 2 {
+        // rephrase when the sentence form starves: engines match keyword
+        // queries better, and an empty first round must not become a
+        // verdict against the manual (retrieval failure ≠ guilt)
+        let keys: String = claim
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|w| w.len() > 3)
+            .take(8)
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !keys.is_empty() && keys != full {
+            for u in search_clean(&keys).await {
+                if out.len() >= 3 {
+                    break;
+                }
+                if !out.contains(&u) {
+                    out.push(u);
+                }
+            }
+        }
     }
     out.into_iter().take(3).collect()
+}
+
+async fn search_clean(q: &str) -> Vec<String> {
+    let mut out = ddg_search_tries(q, 3, 2, 10).await;
+    if out.is_empty() {
+        out = marginalia_tries(q, 3, 2, 10).await;
+    }
+    out.into_iter().filter(|u| !junk_evidence_url(u)).take(3).collect()
+}
+
+/// Issue trackers read as "evidence" but carry no checkable content: a REDO
+/// once blamed the manual for GitHub-issue "sources" the engines coughed up
+/// while throttled. Filtered before fetching (saves fetches too).
+fn junk_evidence_url(u: &str) -> bool {
+    let l = u.to_lowercase();
+    l.contains("/issues/")
+        || l.contains("/pull/")
+        || l.contains("/discussions/")
+        || l.contains("/-/issues")
+        || l.contains("/-/merge_requests")
 }
 
 fn wikipedia_api(query: &str) -> String {
@@ -2481,5 +2519,26 @@ mod marks_tests {
         );
         assert!(m.iter().any(|t| t == "hermes"), "figure kept: {m:?}");
         assert!(m.iter().any(|t| t == "trismegistus"), "figure kept: {m:?}");
+    }
+}
+
+#[cfg(test)]
+mod evidence_tests {
+    use super::junk_evidence_url;
+
+    #[test]
+    fn issue_trackers_are_not_evidence() {
+        assert!(junk_evidence_url("https://github.com/MarginaliaSearch/MarginaliaSearch/issues/305"));
+        assert!(junk_evidence_url("https://github.com/a/b/pull/12"));
+        assert!(junk_evidence_url("https://gitlab.com/a/b/-/issues/3"));
+        assert!(junk_evidence_url("https://github.com/a/b/discussions/7"));
+    }
+
+    #[test]
+    fn real_sources_survive() {
+        assert!(!junk_evidence_url("https://en.wikipedia.org/wiki/Hermeticism"));
+        assert!(!junk_evidence_url("https://github.com/ElegantVW/magpie"));
+        assert!(!junk_evidence_url("https://archive.org/details/corpus-hermeticum-htp"));
+        assert!(!junk_evidence_url("https://plato.stanford.edu/entries/hermetism/"));
     }
 }

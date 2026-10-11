@@ -139,9 +139,11 @@ pub async fn run_judge(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc::
     if claims.is_empty() {
         return Err(MagpieError::Parse("no checkable claims".into()));
     }
-    // ≥10 verification searches of our own (one+ per claim, distinct queries)
+    // ≥10 verification searches of our own (one+ per claim, distinct queries;
+    // verify_search rephrases internally when the sentence form starves)
     send(&format!("judge: verifying {} claims…", claims.len()));
     let mut pairs = vec![];
+    let mut retrieval_failed = 0usize;
     for (i, c) in claims.iter().enumerate() {
         let q: String = c.text.chars().take(80).collect();
         if let Some(tx) = &prog {
@@ -156,18 +158,30 @@ pub async fn run_judge(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc::
                 evidence.push(format!("{}: {}", u, p));
             }
         }
-        pairs.push(serde_json::json!({"claim": c.text, "section": c.section, "manual_source": c.source, "evidence": evidence}));
+        // empty evidence is a retrieval failure, not a verdict against the
+        // manual (engines throttle; junk hosts filter). Marked on the pair
+        // so deliberation can abstain instead of punishing.
+        let retrieval = if evidence.is_empty() { retrieval_failed += 1; "failed" } else { "ok" };
+        if retrieval == "failed" {
+            if let Some(tx) = &prog {
+                let _ = tx.send(format!("judge: no evidence for claim {}/{} (retrieval failed, abstaining)", i + 1, claims.len()));
+            }
+        }
+        pairs.push(serde_json::json!({"claim": c.text, "section": c.section, "manual_source": c.source, "evidence": evidence, "retrieval": retrieval}));
+    }
+    if retrieval_failed > 0 {
+        send(&format!("judge: retrieval failed on {retrieval_failed}/{} claims (marked, not punished)", claims.len()));
     }
     // one judge call over all pairs
     let (endpoint, via_tag) = crate::llm::llm_endpoint().await;
     // no client-level timeout: chat_once governs (600s send / 60s body).
     // The deliberation payload is ~12KB of evidence; 30s was too tight.
     let client = reqwest::Client::new();
-    let sys = "You are the judge of a researched manual. For each claim, verdict supported|contested|unverified from the evidence. Then overall APPROVED or REDO. Reply ONLY JSON.";
+    let sys = "You are the judge of a researched manual. For each claim, verdict supported|contested|unverified|unverifiable from the evidence. Then overall APPROVED or REDO. Reply ONLY JSON. Unverifiable is ONLY for pairs with retrieval failed (no evidence to judge from) — it abstains and must not alone force REDO. REDO needs contested claims, or unverified claims WITH good evidence behind them.";
     let user = serde_json::json!({
         "manual": query,
         "pairs": pairs,
-        "want": {"verdicts": [{"claim": "", "verdict": "supported|contested|unverified", "note": "under 90 chars"}], "overall": "APPROVED|REDO", "comment": "why approved and how fact-checked, or why it must be redone"}
+        "want": {"verdicts": [{"claim": "", "verdict": "supported|contested|unverified|unverifiable", "note": "under 90 chars"}], "overall": "APPROVED|REDO", "comment": "why approved and how fact-checked, or why it must be redone"}
     })
     .to_string();
     send("judge: deliberating…");
