@@ -135,14 +135,7 @@ fn floor_char_boundary(s: &str, mut i: usize) -> usize {
 }
 
 /// Convenience: system + user + enforced JSON object, parsed or None.
-pub async fn chat_json(
-    client: &reqwest::Client,
-    endpoint: &str,
-    sys: &str,
-    user: &str,
-    max_tokens: u32,
-    temperature: f32,
-) -> Option<ChatOut> {
+pub fn fit_user(sys: &str, user: &str, max_tokens: u32) -> String {
     // clamp the user turn to fit: window - reply budget - system - slack.
     // head+tail (never head-only: chapter headings and closing specs live
     // at the end of a chunk and the model needs them).
@@ -151,16 +144,31 @@ pub async fn chat_json(
         .saturating_sub(max_tokens as usize + sys_tok + 64)
         .max(256);
     let budget = room * CHARS_PER_TOKEN;
-    let user: String = if user.len() <= budget {
-        user.to_string()
-    } else {
-        let head = budget * 3 / 5;
-        let tail = budget - head;
-        let cut = floor_char_boundary(user, head);
-        let tstart = floor_char_boundary(user, user.len() - tail);
-        format!("{}\n[...{:.0} chars elided: prompt fitted to the {}-token window...]\n{}", &user[..cut], (user.len() - tail - cut) as f64, CTX_TOKENS, &user[tstart..])
-    };
-    let user = user.as_str();
+    if user.len() <= budget {
+        return user.to_string();
+    }
+    let head = budget * 3 / 5;
+    let tail = budget - head;
+    let cut = floor_char_boundary(user, head);
+    let tstart = floor_char_boundary(user, user.len() - tail);
+    format!(
+        "{}\n[...{} chars elided: prompt fitted to the {}-token window...]\n{}",
+        &user[..cut],
+        user.len() - tail - cut,
+        CTX_TOKENS,
+        &user[tstart..]
+    )
+}
+
+pub async fn chat_json(
+    client: &reqwest::Client,
+    endpoint: &str,
+    sys: &str,
+    user: &str,
+    max_tokens: u32,
+    temperature: f32,
+) -> Option<ChatOut> {
+    let user = &fit_user(sys, user, max_tokens);
     let body = serde_json::json!({
         "messages": [{"role": "system", "content": sys}, {"role": "user", "content": user}],
         "temperature": temperature,
@@ -392,5 +400,31 @@ mod ctx_tests {
         let total_tok = sys_tok + room + 1024;
         assert!(total_tok < CTX_TOKENS, "{total_tok} must fit {CTX_TOKENS}");
         assert!(room >= 256, "floor keeps a usable prompt");
+    }
+}
+
+#[cfg(test)]
+mod fit_tests {
+    use super::fit_user;
+
+    #[test]
+    fn short_prompts_pass_through_untouched() {
+        assert_eq!(fit_user("sys", "hello", 400), "hello");
+    }
+
+    #[test]
+    fn giant_facts_blob_is_fitted_and_marked() {
+        let blob = "x".repeat(200_000);
+        let out = fit_user("s", &blob, 400);
+        assert!(out.len() < 30_000, "{}", out.len());
+        assert!(out.contains("elided"), "the model must know it lost text");
+        assert!(out.starts_with('x') && out.ends_with('x'));
+    }
+
+    #[test]
+    fn multibyte_tail_slice_is_valid_utf8() {
+        let blob = "é".repeat(100_000); // 2 bytes per char
+        let out = fit_user("s", &blob, 400);
+        assert!(out.is_char_boundary(out.len()));
     }
 }

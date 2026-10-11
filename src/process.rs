@@ -596,6 +596,9 @@ pub async fn run_process(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc
                 "{{\"manual\": \"{query}\", \"chapter\": \"{ch}\", \"facts\": {:?}, \"want\": {{\"intro\": \"150-250 word overview, no new facts\"}}}}",
                 facts
             );
+            // the facts array is unbounded — chapter synthesis overflowed
+            // the window on its own (same empty-completion failure)
+            let user = crate::llm::fit_user(sys, &user, 400);
             let body = serde_json::json!({
                 "messages": [{"role": "system", "content": sys}, {"role": "user", "content": user}],
                 "temperature": 0.3,
