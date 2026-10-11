@@ -70,20 +70,40 @@ pub async fn chat_once(client: &reqwest::Client, url: &str, body: &serde_json::V
 
 /// Extract the model's JSON from a chat response: tool_calls first,
 /// then the {"name","arguments"} envelope this server build emits,
-/// then raw content JSON.
+/// then raw content JSON. Unwraps a top-level "want" object: small models
+/// echo the user message's want-block instead of the tool schema
+/// ({"want": {"kind":..,"relevance":25,..}} — balanced, misplaced, and
+/// once silently dropped 16 pages into heuristic fallbacks).
+/// A legitimate answer never carries top-level "want" (not in the schema),
+// so the unwrap cannot misfire on good output.
 pub fn extract_json(txt: &str) -> Option<(serde_json::Value, bool)> {
     let root: serde_json::Value = serde_json::from_str(txt).ok()?;
     if let Some(s) = root["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"].as_str() {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
-            return Some((v, true));
+            return Some((unwrap_want(v), true));
         }
     }
     let content = root["choices"][0]["message"]["content"].as_str().unwrap_or_default();
     let v: serde_json::Value = serde_json::from_str(content.trim()).ok()?;
     if v.get("name").is_some() && v.get("arguments").is_some() {
-        return Some((v["arguments"].clone(), true));
+        return Some((unwrap_want(v["arguments"].clone()), true));
     }
-    Some((v, false))
+    Some((unwrap_want(v), false))
+}
+
+/// Descend through task-echo wrappers ("want", and nothing else).
+fn unwrap_want(v: serde_json::Value) -> serde_json::Value {
+    const KEYS: &[&str] = &["kind", "bullets", "specs", "quotes", "relevance", "section"];
+    let mut cur = v;
+    loop {
+        let has_inner = cur.get("want").map(|w| w.is_object()).unwrap_or(false);
+        let has_own = KEYS.iter().any(|k| cur.get(k).is_some());
+        if has_inner && !has_own {
+            cur = cur["want"].clone();
+        } else {
+            return cur;
+        }
+    }
 }
 
 /// What one enforced-JSON round trip yields: the parsed value, how it
@@ -270,5 +290,36 @@ mod tests {
     fn garbage_stays_none() {
         assert!(salvage_json("no json here").is_none());
         assert!(salvage_json("{").is_none());
+    }
+}
+
+#[cfg(test)]
+mod extract_tests {
+    use super::extract_json;
+
+    fn envelope(content: &str) -> String {
+        serde_json::json!({"choices": [{"message": {"content": content}}]}).to_string()
+    }
+
+    #[test]
+    fn unwraps_want_echo() {
+        // the de Mahieu failure shape: balanced, misplaced, score inside
+        let out = extract_json(&envelope(r#"{"want": {"kind": "facts", "relevance": 25, "section": "Facts", "bullets": ["x"], "specs": [], "quotes": []}}"#))
+            .expect("must parse");
+        assert_eq!(out.0.get("relevance").and_then(|r| r.as_i64()), Some(25));
+        assert_eq!(out.0.get("kind").and_then(|k| k.as_str()), Some("facts"));
+    }
+
+    #[test]
+    fn legit_answers_untouched() {
+        // no top-level want: returned as-is (both envelope and raw paths)
+        let good = r#"{"kind": "history", "relevance": 95, "section": "History", "bullets": [], "specs": [], "quotes": []}"#;
+        let out = extract_json(&envelope(good)).expect("must parse");
+        assert_eq!(out.0.get("relevance").and_then(|r| r.as_i64()), Some(95));
+        // a hypothetical answer that BOTH scores and (oddly) carries want:
+        // own keys win, no descend
+        let both = r#"{"kind": "facts", "relevance": 80, "want": {"kind": "other"}}"#;
+        let out2 = extract_json(&envelope(both)).expect("must parse");
+        assert_eq!(out2.0.get("kind").and_then(|k| k.as_str()), Some("facts"));
     }
 }

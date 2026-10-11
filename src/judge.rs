@@ -8,47 +8,81 @@ use crate::error::{MagpieError, Result};
 struct Claim {
     text: String,
     source: String,
+    section: String,
 }
 
-/// Top claims, spec/fault kinds first (checkable facts beat prose).
+/// Top claims, round-robin across SECTIONS (each chapter gets examined),
+/// checkable kinds first within a section. The old kind-first order let a
+/// dominant section eat all 10 slots — Guenon filed as canon was never
+/// adjudicated while canon claims were checked twice.
 fn top_claims(entries: &[serde_json::Value]) -> Vec<Claim> {
-    let mut ordered: Vec<&serde_json::Value> = vec![];
+    // per-section entry lists, checkable kinds first inside each
+    let mut sections: Vec<(String, Vec<&serde_json::Value>)> = vec![];
+    for e in entries {
+        let sec = e.get("section").and_then(|s| s.as_str()).unwrap_or("").to_string();
+        if !sections.iter().any(|(s, _)| *s == sec) {
+            sections.push((sec, vec![]));
+        }
+    }
     for kind in ["spec", "fault", "facts", "review", "dimensions", "howto", "reference", "history", "other"] {
         for e in entries.iter().filter(|e| e.get("kind").and_then(|k| k.as_str()) == Some(kind)) {
-            ordered.push(e);
+            let sec = e.get("section").and_then(|s| s.as_str()).unwrap_or("");
+            if let Some((_, list)) = sections.iter_mut().find(|(s, _)| *s == sec) {
+                list.push(e);
+            }
         }
     }
     let mut out = vec![];
     let mut seen_sig: std::collections::HashSet<String> = Default::default();
-    for e in ordered {
-        let source = e.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string();
-        let mut facts: Vec<String> = vec![];
-        if let Some(arr) = e.get("bullets").and_then(|b| b.as_array()) {
-            for b in arr.iter().take(2) {
-                if let Some(s) = b.as_str() {
-                    facts.push(s.to_string());
+    // round-robin: one claim per section per turn until 10
+    'rounds: loop {
+        let mut advanced = false;
+        for (sec, list) in sections.iter_mut() {
+            while let Some(e) = list.first().cloned() {
+                *list = list[1..].to_vec();
+                advanced = true;
+                let source = e.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string();
+                let mut facts: Vec<String> = vec![];
+                if let Some(arr) = e.get("bullets").and_then(|b| b.as_array()) {
+                    for b in arr.iter().take(2) {
+                        if let Some(s) = b.as_str() {
+                            facts.push(s.to_string());
+                        }
+                    }
                 }
+                if let Some(arr) = e.get("specs").and_then(|b| b.as_array()) {
+                    for s in arr.iter().take(2) {
+                        if let (Some(k), Some(v)) = (s.get(0).and_then(|x| x.as_str()), s.get(1).and_then(|x| x.as_str())) {
+                            facts.push(format!("{k}: {v}"));
+                        }
+                    }
+                }
+                let mut took = false;
+                for f in facts {
+                    if f.chars().count() > 25 {
+                        // specs often restate the bullet above them; one slot per fact
+                        let sig: String = f.to_lowercase().chars().filter(|c| c.is_alphanumeric()).take(48).collect();
+                        if !seen_sig.insert(sig) {
+                            continue;
+                        }
+                        out.push(Claim { text: f.chars().take(160).collect(), source: source.clone(), section: sec.clone() });
+                        took = true;
+                    }
+                    if out.len() >= 10 {
+                        break 'rounds;
+                    }
+                    if took {
+                        break;
+                    }
+                }
+                if took {
+                    break;
+                }
+                // entry yielded nothing checkable: keep scanning this section
             }
         }
-        if let Some(arr) = e.get("specs").and_then(|b| b.as_array()) {
-            for s in arr.iter().take(2) {
-                if let (Some(k), Some(v)) = (s.get(0).and_then(|x| x.as_str()), s.get(1).and_then(|x| x.as_str())) {
-                    facts.push(format!("{k}: {v}"));
-                }
-            }
-        }
-        for f in facts {
-            if f.chars().count() > 25 {
-                // specs often restate the bullet above them; one slot per fact
-                let sig: String = f.to_lowercase().chars().filter(|c| c.is_alphanumeric()).take(48).collect();
-                if !seen_sig.insert(sig) {
-                    continue;
-                }
-                out.push(Claim { text: f.chars().take(160).collect(), source: source.clone() });
-            }
-            if out.len() >= 10 {
-                return out;
-            }
+        if !advanced {
+            break;
         }
     }
     out
@@ -122,7 +156,7 @@ pub async fn run_judge(dir: std::path::PathBuf, prog: Option<tokio::sync::mpsc::
                 evidence.push(format!("{}: {}", u, p));
             }
         }
-        pairs.push(serde_json::json!({"claim": c.text, "manual_source": c.source, "evidence": evidence}));
+        pairs.push(serde_json::json!({"claim": c.text, "section": c.section, "manual_source": c.source, "evidence": evidence}));
     }
     // one judge call over all pairs
     let (endpoint, via_tag) = crate::llm::llm_endpoint().await;
@@ -357,5 +391,42 @@ mod gate_tests {
         assert_eq!(rec.get("overall").and_then(|o| o.as_str()), Some("REDO"));
         assert_eq!(rec.get("via").and_then(|x| x.as_str()), Some("heuristic:unscored"));
         assert_eq!(rec.get("searches").and_then(|s| s.as_u64()), Some(0), "no searches spent on unscored");
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::top_claims;
+
+    fn entry(section: &str, kind: &str, bullet: &str, url: &str) -> serde_json::Value {
+        serde_json::json!({
+            "kind": kind, "title": "T", "url": url, "via": "llm:test:json",
+            "bullets": [bullet], "specs": [], "quotes": [], "section": section,
+            "claimed_by": 0, "relevance": 90
+        })
+    }
+
+    #[test]
+    fn every_section_gets_examined() {
+        let mut entries = vec![];
+        // dominant section floods with 8 entries; two small sections have 1 each
+        for i in 0..8 {
+            entries.push(entry("Canon & books", "facts", &format!("canon checkable fact number {i} about hermetic corpus"), &format!("https://canon.example/{i}")));
+        }
+        entries.push(entry("History", "history", "guenon traditionalist influence on modern esoteric movements everywhere", "https://guenon.example/1"));
+        entries.push(entry("Techniques", "howto", "hermetic meditation technique involving breath and visualization practice", "https://tech.example/1"));
+        let claims = top_claims(&entries);
+        let mut secs: Vec<&str> = claims.iter().map(|c| c.section.as_str()).collect();
+        secs.sort();
+        secs.dedup();
+        assert!(secs.contains(&"History"), "guenon wing examined: {secs:?}");
+        assert!(secs.contains(&"Techniques"), "techniques wing examined: {secs:?}");
+        // round-robin order: first claim per section before any section's second
+        let firsts: Vec<&str> = claims.iter().take(3).map(|c| c.section.as_str()).collect();
+        assert_eq!(firsts.len(), 3);
+        let mut f = firsts.clone();
+        f.sort();
+        f.dedup();
+        assert_eq!(f.len(), 3, "one per section first: {firsts:?}");
     }
 }
