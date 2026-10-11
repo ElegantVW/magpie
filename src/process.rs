@@ -93,7 +93,7 @@ async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, ch
             // both tries failed (timeout, eviction, down slot): on the
             // record, with identity — silent fallbacks filled a manual once
             fail_log.push(serde_json::json!({"title": title, "url": base, "kind": "no-response"}));
-            let sec = chapters.last().cloned().unwrap_or_else(|| "Other".into());
+            let sec = chapters.first().cloned().unwrap_or_else(|| "Other".into());
             let (k, b, s, q, sec, via) = with_via(heuristic(title, &excerpt), vec![], sec, "heuristic:no-llm");
             return (k, b, s, q, sec, via, -1);
         }
@@ -155,14 +155,17 @@ async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, ch
                     .collect()
             })
             .unwrap_or_default();
-        // chapter assignment, validated against the outline; unknown falls
-        // back to the last chapter (always the misc bucket)
+        // chapter assignment, validated against the outline. Missing or
+        // unknown sections default to the FIRST chapter (the subject
+        // chapter: Canon, Specifications...) — the old last-chapter fallback
+        // misfiled section-less output as Key figures/Dimensions (probed:
+        // good 95-score output sometimes carries no section key at all).
         let raw_sec = v.get("section").and_then(|s| s.as_str()).unwrap_or("").to_string();
         let section = chapters
             .iter()
             .find(|c| c.to_lowercase() == raw_sec.to_lowercase())
             .cloned()
-            .unwrap_or_else(|| chapters.last().cloned().unwrap_or_else(|| "Other".into()));
+            .unwrap_or_else(|| chapters.first().cloned().unwrap_or_else(|| "Other".into()));
         if bullets.is_empty() && specs.is_empty() && quotes.is_empty() {
             return None;
         }
@@ -186,7 +189,7 @@ async fn process_one(client: &reqwest::Client, endpoint: &str, via_tag: &str, ch
                 "finish": finish, "completion_tokens": comp_tokens, "raw": raw_head,
             }));
             let (k, b, s) = heuristic(title, &excerpt);
-            (k, b, s, vec![], chapters.last().cloned().unwrap_or_else(|| "Other".into()), "heuristic:parse".into(), -1)
+            (k, b, s, vec![], chapters.first().cloned().unwrap_or_else(|| "Other".into()), "heuristic:parse".into(), -1)
         }
     }
 }
