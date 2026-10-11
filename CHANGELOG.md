@@ -1,5 +1,10 @@
 # Changelog — magpie
 
+## v0.1.0 nest-egg (2026-10-11)
+
+- First number. Thorough seeker, producer arc live.
+
+
 ## Unreleased — producer arc (release name: `nest-egg`, cut on the first APPROVED manual)
 - Producer passes: LLM query expansion pre-crawl, 30-language Wikidata fan-out, post-crawl judge (text verdicts; APPROVED appends appendix, REDO costs no render).
 - Relevance that bites: subject-anchored scoring, distinguishing marks (years/engines/names), namesake filter, unscored-defaults-drop, per-entry scores stored.
